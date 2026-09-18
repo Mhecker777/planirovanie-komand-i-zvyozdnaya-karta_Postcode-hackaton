@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Вход — TeamHub</title>
+  <link rel="stylesheet" href="css/base.css">
+  <link rel="stylesheet" href="css/components.css">
+  <link rel="stylesheet" href="css/pages/login.css">
+</head>
+<body>
+  <div class="login-page">
+    <form class="login-card" action="index" method="get">
+      <div class="login-logo">TeamHub</div>
+      <p class="login-subtitle">Вход в панель управления</p>
+
+      <label class="field">
+        <span class="field-label">Логин</span>
+        <input type="text" name="username" class="field-input" placeholder="Введите логин" autocomplete="username" required>
+      </label>
+
+      <label class="field">
+        <span class="field-label">Пароль</span>
+        <input type="password" name="password" class="field-input" placeholder="Введите пароль" autocomplete="current-password" required>
+      </label>
+
+      <button type="submit" class="login-button">Войти</button>
+
+      <div class="login-error" hidden>Неверный логин или пароль</div>
+    </form>
+  </div>
+</body>
+</html>

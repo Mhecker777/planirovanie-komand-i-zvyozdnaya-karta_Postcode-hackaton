@@ -1,24 +1,32 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import sys
 import os
+import sys
 from datetime import date, timedelta
 
-sys.path.append(os.path.abspath("src"))
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, '..')) if os.path.basename(CURRENT_DIR) == 'src' else CURRENT_DIR
+
+# Надёжный импорт локальных модулей независимо от того, запускается ли app.py
+# из корня проекта или из src/.
+src_dir = os.path.join(PROJECT_ROOT, 'src')
+for import_dir in (CURRENT_DIR, src_dir, PROJECT_ROOT):
+    if import_dir not in sys.path:
+        sys.path.insert(0, import_dir)
+
 from scheduler import SmartScheduler
 from analytics import StarMapAnalytics
 
-st.set_page_config(page_title="ПочтаТех — Планировщик", page_icon="📦", layout="wide")
 
-# ===== КРУПНЫЙ, РАЗБОРЧИВЫЙ ИНТЕРФЕЙС =====
-# Базовый Streamlit-стиль довольно мелкий и плотный для дашборда, которым
-# пользуются тимлиды/РМ/ИТ-директор на своём экране, а не разработчики в IDE.
-# Увеличиваем шрифты ключевых элементов и добавляем видимые границы карточкам
-# метрик, чтобы контраст между 4 KPI на первом экране считывался сразу.
-st.markdown("""
+st.set_page_config(page_title='ПочтаТех — Планировщик', page_icon='📦', layout='wide')
+
+st.markdown(
+    '''
 <style>
-html, body, [class*="css"]  { font-size: 17px; }
+html, body, [class*="css"] { font-size: 17px; }
 div[data-testid="stMetric"] {
     background-color: rgba(120, 120, 120, 0.06);
     border: 1px solid rgba(120, 120, 120, 0.18);
@@ -31,356 +39,457 @@ div[data-testid="stMetricLabel"] { font-size: 0.95rem; opacity: 0.85; }
 h1 { font-size: 2.1rem !important; }
 h3, h4, h5 { margin-top: 0.6rem; }
 </style>
-""", unsafe_allow_html=True)
+''',
+    unsafe_allow_html=True,
+)
 
-st.title("📦 ПочтаТех: Квартальное планирование (PI)")
+st.title('📦 ПочтаТех: Квартальное планирование (PI)')
 
-with st.expander("📖 Как читать этот дашборд — короткая справка"):
-    st.markdown("""
-- **Bus Factor** — сколько человек в компании (или в конкретной команде) владеют технологией.
-  Bus Factor = 1 — риск: если этот человек в отпуске/уволился, работу по технологии выполнить некому.
-- **«Растянута (Сплиттинг)»** — задаче не хватило часов специалистов в одном спринте, она продолжается в следующем.
-- **«Реорганизация (Перевод)»** — алгоритм временно взял часы специалиста из другой команды, у которой их не хватало в своей.
-- **Зазор между зависимостями** — если задача А блокирует задачу Б, Б не может начаться раньше спринта, следующего за тем, в котором А завершилась (нельзя стартовать в тот же спринт).
-- **Say/Do Ratio** — сколько Story Points реально сделано по факту от того, что было изначально запланировано (не путать с самим пересчитанным планом).
-- **🔴🟡🟠 алерты** — 🔴 задача точно не уложится в квартал; 🟡 её задержка реально сдвинула другие задачи; 🟠 в конкретном спринте не хватило часов роли даже после попытки перевода из других команд.
-    """)
-
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..")) if os.path.basename(
-    CURRENT_DIR) == "src" else CURRENT_DIR
-DATA_PATH = os.path.join(PROJECT_ROOT, "data", "dataset.xlsx")
-
-
-@st.cache_data
-def load_base_data():
-    sched = SmartScheduler(DATA_PATH)
-    analytics = StarMapAnalytics(DATA_PATH)
-    return sched, analytics, sched.run_smart_planning()
+with st.expander('📖 Как читать этот дашборд — короткая справка'):
+    st.markdown(
+        '''
+- **Bus Factor** — сколько человек в компании или команде владеют технологией.
+- **SP** — Story Points задачи. Commitment резервируется только один раз, при первом включении задачи.
+- **HH** — трудозатраты в человеко-часах. Именно HH расходуются по ролям внутри спринта.
+- **«Растянута (Сплиттинг)»** — задача не помещается целиком по HH в одном спринте и продолжает выполняться в следующем; SP повторно не списываются.
+- **«Реорганизация (Перевод)»** — временное использование свободных часов нужной роли из другой команды.
+- **Зазор между зависимостями** — задача-потомок стартует не раньше следующего спринта после завершения предшественника.
+- **Say/Do Ratio** — фактически завершённые SP / SP из исходного baseline-плана конкретного спринта.
+- **🔴🟡🟠 алерты** — срыв задачи, фактически наблюдаемый каскадный сдвиг и дефицит роли в конкретном спринте.
+'''
+    )
 
 
-sched, analytics, base_results = load_base_data()
-b_schedule, b_statuses, b_logs, b_alerts, b_kpis, b_burned = base_results
+def resolve_data_path() -> str:
+    candidates = [
+        os.path.join(PROJECT_ROOT, 'data', 'dataset.xlsx'),
+        os.path.join(PROJECT_ROOT, 'dataset.xlsx'),
+        os.path.join(CURRENT_DIR, 'data', 'dataset.xlsx'),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        'Не найден dataset.xlsx. Ожидался один из путей: ' + ', '.join(candidates)
+    )
+
+
+DATA_PATH = resolve_data_path()
+
+
+@st.cache_resource(show_spinner=False)
+def load_models(data_path: str):
+    sched = SmartScheduler(data_path)
+    analytics = StarMapAnalytics(data_path)
+    return sched, analytics
+
+
+@st.cache_data(show_spinner=False)
+def load_base_plan(data_path: str):
+    sched = SmartScheduler(data_path)
+    return sched.run_smart_planning()
+
+
+sched, analytics = load_models(DATA_PATH)
+b_schedule, b_statuses, b_logs, b_alerts, b_kpis, b_burned = load_base_plan(DATA_PATH)
+
 bf_df = analytics.get_bus_factor_and_training()
+bf_team_df = analytics.get_bus_factor_by_team()
 roles_df = analytics.get_critical_roles_shortage()
 
-# ===== СИНХРОНИЗАЦИЯ С РЕАЛЬНЫМ КАЛЕНДАРЁМ =====
-# В датасете есть planned_start/planned_end по задачам, но они разбросаны
-# почти на год (сентябрь 2025 — июль 2026) и не образуют один связный
-# 12-недельный квартал — выводить дату старта квартала ИЗ них означало бы
-# подсунуть недостоверную дату. Поэтому старт квартала — явный выбор
-# пользователя, а не вычисление из зашумлённых данных.
-st.sidebar.header("📅 Календарь квартала")
-default_quarter_start = date.today() - timedelta(days=date.today().weekday())  # ближайший понедельник, для аккуратности
-quarter_start = st.sidebar.date_input("Дата старта квартала (Спринт 1):", value=default_quarter_start)
+# ===== КАЛЕНДАРЬ =====
+st.sidebar.header('📅 Календарь квартала')
+default_quarter_start = date.today() - timedelta(days=date.today().weekday())
+quarter_start = st.sidebar.date_input(
+    'Дата старта квартала (Спринт 1):',
+    value=default_quarter_start,
+)
 
-sprint_date_ranges = {}
-for i in range(1, 7):
-    s_start = quarter_start + timedelta(days=14 * (i - 1))
-    s_end = s_start + timedelta(days=13)
-    sprint_date_ranges[i] = (s_start, s_end)
+sprint_date_ranges = {
+    i: (
+        quarter_start + timedelta(days=14 * (i - 1)),
+        quarter_start + timedelta(days=14 * (i - 1) + 13),
+    )
+    for i in range(1, 7)
+}
 
 
 def sprint_label(i: int) -> str:
-    s_start, s_end = sprint_date_ranges[i]
-    return f"Спринт {i} ({s_start.strftime('%d.%m')}–{s_end.strftime('%d.%m')})"
+    start, end = sprint_date_ranges[i]
+    return f'Спринт {i} ({start:%d.%m}–{end:%d.%m})'
 
 
-# Автоподсказка текущего спринта по сегодняшней дате — пользователь всё
-# равно может выбрать вручную любой другой пункт в селекторе ниже.
-# Считаем спринт "завершённым" только если сегодняшняя дата ПОЗЖЕ его
-# конца — если сегодня внутри диапазона спринта, он ещё идёт и не должен
-# считаться пройденным по умолчанию.
 today = date.today()
 auto_sprint_idx = 0
 for i in range(1, 7):
-    _, s_end = sprint_date_ranges[i]
-    if today > s_end:
+    if today > sprint_date_ranges[i][1]:
         auto_sprint_idx = i
 
-# ===== БОКОВАЯ ПАНЕЛЬ: УМНЫЙ ВВОД ФАКТА =====
-st.sidebar.markdown("---")
-st.sidebar.header("⏳ Симуляция времени (Факт)")
-sprint_options = ["Старт квартала (Спринт 0)"] + [f"Завершен {sprint_label(i)}" for i in range(1, 6)]
+st.sidebar.markdown('---')
+st.sidebar.header('⏳ Симуляция времени (Факт)')
+sprint_options = ['Старт квартала (Спринт 0)'] + [f'Завершен {sprint_label(i)}' for i in range(1, 7)]
 selected_time = st.sidebar.selectbox(
-    "Выберите текущую дату:", sprint_options,
+    'Выберите текущую дату:',
+    sprint_options,
     index=min(auto_sprint_idx, len(sprint_options) - 1),
-    help="По умолчанию подставлен спринт, в который попадает сегодняшняя дата при выбранном старте квартала."
+    help='По умолчанию выбран последний полностью завершившийся спринт.',
 )
 current_time_sprint = sprint_options.index(selected_time)
 
+# ===== ФАКТ =====
 fact_sprint_done = {}
 if current_time_sprint > 0:
-    st.sidebar.markdown("### ✅ Внесение факта")
-    st.sidebar.caption("Отметьте галочкой то, что реально завершено. Снятая галочка — задача переезжает в следующий спринт.")
+    st.sidebar.markdown('### ✅ Внесение факта')
+    st.sidebar.caption('Отметьте только реально завершённые задачи. По умолчанию все чекбоксы сняты.')
 
-    available_tasks = sched.tasks['task_id'].tolist()
+    all_task_ids = sched.tasks['task_id'].tolist()
+    for sprint in range(1, current_time_sprint + 1):
+        with st.sidebar.expander(f'Факт: {sprint_label(sprint)}', expanded=(sprint == current_time_sprint)):
+            baseline_ids = []
+            seen = set()
+            for item in b_schedule.get(sprint, []):
+                tid = item['task_id']
+                if tid in all_task_ids and tid not in seen:
+                    baseline_ids.append(tid)
+                    seen.add(tid)
 
-    for s in range(1, current_time_sprint + 1):
-        with st.sidebar.expander(f"Факт: {sprint_label(s)}", expanded=(s == current_time_sprint)):
-            # Основной список — то, что ИЗНАЧАЛЬНО планировалось на этот спринт
-            # (чек-лист с чекбоксом на каждую задачу, а не мультиселект, где
-            # "не завершено" приходилось выражать УДАЛЕНИЕМ строки — легко
-            # промахнуться и не всегда очевидно, что осталось).
-            baseline_ids = [t['task_id'] for t in b_schedule[s] if
-                            'Завершена' in t['status'] and t['task_id'] in available_tasks]
+            prior_fact_ids = set(fact_sprint_done)
+            baseline_ids = [tid for tid in baseline_ids if tid not in prior_fact_ids]
 
             if baseline_ids:
                 rows = []
                 for tid in baseline_ids:
-                    trow = sched.tasks.loc[sched.tasks['task_id'] == tid].iloc[0]
-                    rows.append({'Задача': tid, 'Команда': trow['team_id'], 'SP': int(trow['estimation_sp']),
-                                'Завершено': True})
-                edit_df = pd.DataFrame(rows)
-                edited = st.data_editor(
-                    edit_df,
-                    column_config={'Завершено': st.column_config.CheckboxColumn('Реально завершено?')},
-                    disabled=['Задача', 'Команда', 'SP'],
-                    hide_index=True, use_container_width=True, key=f"editor_{s}"
-                )
-                selected = edited.loc[edited['Завершено'], 'Задача'].tolist()
+                    matches = sched.tasks.loc[sched.tasks['task_id'] == tid]
+                    if matches.empty:
+                        continue
+                    trow = matches.iloc[0]
+                    rows.append(
+                        {
+                            'Задача': tid,
+                            'Команда': trow['team_id'],
+                            'SP': int(trow['estimation_sp']),
+                            'Завершено': False,
+                        }
+                    )
+
+                if rows:
+                    edit_df = pd.DataFrame(rows)
+                    edited = st.data_editor(
+                        edit_df,
+                        column_config={'Завершено': st.column_config.CheckboxColumn('Реально завершено?')},
+                        disabled=['Задача', 'Команда', 'SP'],
+                        hide_index=True,
+                        use_container_width=True,
+                        key=f'editor_{sprint}',
+                    )
+                    selected = edited.loc[edited['Завершено'], 'Задача'].tolist()
+                else:
+                    selected = []
             else:
-                st.caption("На этот спринт по базовому плану ничего не было запланировано.")
+                st.caption('На этот спринт по baseline-плану ничего не осталось для подтверждения.')
                 selected = []
 
-            # Отдельно — если по факту сделали что-то СВЕРХ исходного плана
-            extra_pool = [t for t in available_tasks if t not in baseline_ids]
+            extra_pool = [
+                tid for tid in all_task_ids
+                if tid not in baseline_ids and tid not in prior_fact_ids
+            ]
             extra_selected = st.multiselect(
-                f"Дополнительно завершено (не было в плане на спринт {s}):",
-                options=extra_pool, key=f"extra_{s}"
+                'Дополнительно завершено (не было в baseline на этот спринт):',
+                options=extra_pool,
+                key=f'extra_{sprint}',
             )
 
-            for t in selected + extra_selected:
-                fact_sprint_done[t] = s
-                available_tasks.remove(t)
+            for tid in selected + extra_selected:
+                if tid not in fact_sprint_done:
+                    fact_sprint_done[tid] = sprint
 
-# ===== БОКОВАЯ ПАНЕЛЬ: УПРАВЛЯЕМАЯ РЕОРГАНИЗАЦИЯ =====
-# Алгоритм сам переводит часы специалистов между командами при дефиците —
-# это и есть автоматическая реализация "команды можно перестраивать". Но
-# тимлид должен видеть масштаб этих решений и иметь возможность вмешаться
-# вручную, а не узнавать о переводах только постфактум из лога.
-st.sidebar.markdown("---")
-st.sidebar.header("🔧 Управление реорганизацией")
+# Валидация фактических зависимостей
+fact_dependency_warnings = []
+for task_id, done_sprint in fact_sprint_done.items():
+    if task_id not in sched.G:
+        continue
+    for predecessor in sched.G.predecessors(task_id):
+        predecessor_sprint = fact_sprint_done.get(predecessor)
+        if predecessor_sprint is None:
+            fact_dependency_warnings.append(
+                f'{task_id} отмечена завершённой в Спринте {done_sprint}, но зависимость {predecessor} в факте не завершена.'
+            )
+        elif predecessor_sprint >= done_sprint:
+            fact_dependency_warnings.append(
+                f'{task_id} отмечена в Спринте {done_sprint}, но зависимость {predecessor} завершена в Спринте {predecessor_sprint}.'
+            )
+
+if fact_dependency_warnings:
+    st.sidebar.warning('⚠️ Обнаружены нарушения фактических зависимостей')
+    with st.sidebar.expander(f'Показать нарушения ({len(fact_dependency_warnings)})'):
+        for warning in fact_dependency_warnings:
+            st.caption(f'• {warning}')
+
+# ===== УПРАВЛЯЕМАЯ РЕОРГАНИЗАЦИЯ =====
+st.sidebar.markdown('---')
+st.sidebar.header('🔧 Управление реорганизацией')
 transfer_summary = sched.get_transfer_summary(b_logs)
 forbidden_donors = set()
 if not transfer_summary.empty:
     st.sidebar.caption(
-        "Алгоритм сам перевёл часы специалистов между командами там, где не хватало "
-        "своих. Список ниже — из базового плана. Можно запретить конкретный перевод "
-        "и пересчитать план с учётом этого ограничения."
+        'Алгоритм показывает автоматические переводы из baseline. Вы можете запретить конкретную связку «донор + роль» и пересчитать план.'
     )
     ts = transfer_summary.copy()
-    ts['_key'] = ts['Команда-донор'] + ' отдаёт «' + ts['Роль'] + '»'
+    ts['_key'] = ts['Команда-донор'].astype(str) + ' отдаёт «' + ts['Роль'].astype(str) + '»'
     options = ts.drop_duplicates('_key')['_key'].tolist()
-    picked = st.sidebar.multiselect(
-        "Запретить перевод от команды-донора:",
-        options=options,
-        help="Например: «Team-L отдаёт «Разработчик Java»» — если запретить, их задачи в приоритете перед чужими."
-    )
-    for p in picked:
-        donor, role_part = p.split(' отдаёт «')
+    picked = st.sidebar.multiselect('Запретить перевод от команды-донора:', options=options)
+    for value in picked:
+        donor, role_part = value.split(' отдаёт «', 1)
         forbidden_donors.add((donor, role_part.rstrip('»')))
-
-    with st.sidebar.expander(f"Все автопереводы в базовом плане ({len(transfer_summary)})"):
-        st.dataframe(transfer_summary, use_container_width=True, height=250)
+    with st.sidebar.expander(f'Все автопереводы в baseline ({len(transfer_summary)})'):
+        st.dataframe(transfer_summary, use_container_width=True, hide_index=True)
 else:
-    st.sidebar.caption("В базовом плане переводов между командами не потребовалось.")
+    st.sidebar.caption('В baseline-плане переводов между командами не потребовалось.')
 
-# 2. ПЕРЕСЧЕТ ПЛАНА НА ЛЕТУ
-needs_recompute = current_time_sprint > 0 or len(forbidden_donors) > 0
+# ===== ПЕРЕСЧЁТ =====
+needs_recompute = current_time_sprint > 0 or bool(forbidden_donors)
 if needs_recompute:
     c_schedule, c_statuses, c_logs, c_alerts, c_kpis, c_burned = sched.run_smart_planning(
         fact_sprint_done=fact_sprint_done,
         current_time_sprint=current_time_sprint,
-        baseline_schedule=b_schedule,  # нужен, чтобы Say/Do считался от исходного плана, а не от самого себя
-        forbidden_donors=forbidden_donors
+        baseline_schedule=b_schedule,
+        forbidden_donors=forbidden_donors,
     )
 else:
-    c_schedule, c_statuses, c_logs, c_alerts, c_kpis, c_burned = b_schedule, b_statuses, b_logs, b_alerts, b_kpis, b_burned
+    c_schedule, c_statuses, c_logs, c_alerts, c_kpis, c_burned = (
+        b_schedule, b_statuses, b_logs, b_alerts, b_kpis, b_burned
+    )
 
-# ===== БЛОК KPI =====
+# ===== KPI =====
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Предсказуемость квартала", c_kpis['PI Predictability Measure'], "Норма 80-100%")
-col2.metric("Инициатив завершено", f"{c_kpis['Fully Completed Initiatives']} из {c_kpis['Total Initiatives']}")
-col3.metric("Say/Do Ratio (по факту)", c_kpis['Sprint Say/Do Ratio'])
-critical_bf = len(bf_df[bf_df['Bus Factor'] == 1])
-col4.metric("Уязвимых технологий (BF=1)", f"{critical_bf} из {len(bf_df)}", f"-{critical_bf} точек отказа",
-            delta_color="inverse")
+col1.metric('Завершено инициатив', c_kpis['PI Predictability Measure'])
+col2.metric(
+    'Инициатив завершено',
+    f"{c_kpis['Fully Completed Initiatives']} из {c_kpis['Total Initiatives']}",
+)
+col3.metric('Say/Do Ratio (по факту)', c_kpis['Sprint Say/Do Ratio'])
+critical_bf = int((bf_df['Bus Factor'] == 1).sum()) if 'Bus Factor' in bf_df.columns else 0
+col4.metric('Уязвимых технологий (BF=1)', f'{critical_bf} из {len(bf_df)}')
 st.divider()
 
-# ===== ЭКРАН СРАВНЕНИЯ ПЛАН vs ФАКТ =====
 say_do_detail = c_kpis.get('Say/Do Detail') or {}
 if say_do_detail:
-    with st.expander("📊 План vs Факт по пройденным спринтам", expanded=True):
+    with st.expander('📊 План vs Факт по пройденным спринтам', expanded=True):
         detail_rows = [
-            {'Спринт': sprint_label(s), 'Запланировано SP (baseline)': v['planned_sp'],
-             'Сделано по факту SP': v['done_sp'], 'Say/Do': f"{v['ratio']:.1f}%"}
+            {
+                'Спринт': sprint_label(s),
+                'Запланировано SP (baseline)': v['planned_sp'],
+                'Сделано по факту SP': v['done_sp'],
+                'Сделано позже': v['late_done_sp'],
+                'Say/Do': f"{v['ratio']:.1f}%",
+            }
             for s, v in sorted(say_do_detail.items())
         ]
-        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True)
+        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
 
-# ===== ЗАМЕЧАНИЯ К КАЧЕСТВУ ДАННЫХ =====
+# ===== DATA QUALITY =====
 dq_warnings = sched.get_data_quality_warnings()
 if dq_warnings:
-    with st.expander(f"⚠️ Замечания к исходным данным ({len(dq_warnings)})"):
-        for w in dq_warnings:
-            st.caption(f"• {w}")
+    with st.expander(f'⚠️ Замечания к исходным данным ({len(dq_warnings)})'):
+        for warning in dq_warnings:
+            st.caption(f'• {warning}')
 
 # ===== ВКЛАДКИ =====
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📅 План и Задачи", "👥 Трекер сотрудников", "💡 Лог решений", "⭐ Звездная карта", "⚠️ Алерты"])
+    ['📅 План и Задачи', '👥 Трекер сотрудников', '💡 Лог решений', '⭐ Звездная карта', '⚠️ Алерты']
+)
 
-# Вкладка 1: План
 with tab1:
-    gantt_records = [{'Task': t['task_id'], 'Summary': t['summary'], 'Team': t['team'],
-                      'Sprint_Num': s, 'Sprint': sprint_label(s),
-                      'Initiative': t['initiative'], 'Status': t['status'], 'SP': t['sp']} for s, tasks in
-                     c_schedule.items() for t in tasks]
+    gantt_records = [
+        {
+            'Task': item['task_id'],
+            'Rung': item.get('rung', 0),
+            'Summary': item.get('summary', ''),
+            'Team': item.get('team', ''),
+            'Sprint_Num': sprint,
+            'Sprint': sprint_label(sprint),
+            'Initiative': item.get('initiative', 'Без инициативы'),
+            'Status': item.get('status', ''),
+            'SP': item.get('sp', 0),
+            'SP задачи': item.get('task_sp', item.get('sp', 0)),
+            'Списано HH': item.get('burned_hh', 0),
+        }
+        for sprint, tasks in c_schedule.items()
+        for item in tasks
+    ]
+
     if gantt_records:
         gantt_df = pd.DataFrame(gantt_records)
-        fig = px.bar(gantt_df, x="Sprint_Num", y="Task", color="Team", text="Status",
-                     hover_data=["Sprint", "Initiative", "SP", "Summary"],
-                     title="Диаграмма Ганта (Горизонт 12 недель)",
-                     orientation='h')
+        fig = px.bar(
+            gantt_df,
+            x='Sprint_Num',
+            y='Task',
+            color='Team',
+            text='Status',
+            hover_data=['Sprint', 'Initiative', 'Rung', 'SP', 'SP задачи', 'Списано HH', 'Summary'],
+            title='График выполнения задач по кварталу',
+            orientation='h',
+        )
         fig.update_layout(
-            yaxis={'categoryorder': 'total ascending'}, height=600,
-            xaxis=dict(
-                tickmode='array', tickvals=list(range(1, 7)),
-                ticktext=[sprint_label(i) for i in range(1, 7)]
-            )
+            yaxis={'categoryorder': 'total ascending'},
+            height=max(500, min(1000, 30 * gantt_df['Task'].nunique() + 250)),
+            xaxis=dict(tickmode='array', tickvals=list(range(1, 7)), ticktext=[sprint_label(i) for i in range(1, 7)]),
         )
         st.plotly_chart(fig, use_container_width=True)
+        st.download_button(
+            label='📥 Скачать пересчитанный план (CSV)',
+            data=gantt_df.to_csv(index=False, sep=';').encode('utf-8-sig'),
+            file_name='pochtatech_plan.csv',
+            mime='text/csv',
+        )
+    else:
+        st.info('В текущем сценарии ни одна задача не получила плановые часы.')
 
-    st.markdown("---")
-    st.subheader("❌ Задачи, не поместившиеся в квартал (Срыв 12 недель)")
+    st.markdown('---')
+    st.subheader('❌ Задачи, не поместившиеся в квартал')
 
-    def classify_reason(reason: str) -> str:
-        if 'Блокируется' in reason:
-            return '🟡 Ждёт зависимость'
-        if 'Превышен лимит SP' in reason:
-            return '🟠 Не хватает SP команды'
-        if 'дефицит специалистов' in reason.lower():
-            return '🔴 Дефицит специалистов'
-        return '⚪ Другое'
+    reason_labels = {
+        'dependency': '🟡 Ждёт зависимость',
+        'sp_capacity': '🟠 Не хватает SP команды',
+        'role_capacity': '🔴 Дефицит специалистов',
+        'bad_estimate': '⚪ Некорректная смета',
+        'bad_team': '⚪ Не указана команда',
+        'dependency_cycle': '⚪ Цикл зависимостей',
+    }
 
     unscheduled = []
     for _, row in sched.tasks.iterrows():
-        t_id = row['task_id']
-        if c_statuses.get(t_id) != 'Done':
-            reasons = c_logs[(c_logs['task_id'] == t_id) & (c_logs['action'] == 'Перенос')]
-            last_reason = reasons.iloc[-1]['reason'] if not reasons.empty else "Критический дефицит ресурсов"
-            unscheduled.append({
-                'Задача': t_id, 'Инициатива': row['Номер инициативы'], 'Команда': row['team_id'],
-                'Категория': classify_reason(last_reason),
-                'Причина невыполнения (Объяснение)': last_reason,
-            })
+        tid = row['task_id']
+        if c_statuses.get(tid) == 'Done':
+            continue
+        reasons = c_logs[(c_logs['task_id'] == tid) & (c_logs['action'] == 'Перенос')] if not c_logs.empty else pd.DataFrame()
+        if not reasons.empty:
+            last = reasons.iloc[-1]
+            reason_code = str(last.get('reason_code', ''))
+            category = reason_labels.get(reason_code, '⚪ Другое')
+            reason_text = str(last.get('reason', ''))
+        else:
+            category = '⚪ Другое'
+            reason_text = 'Критический дефицит ресурсов или некорректные исходные данные.'
+        unscheduled.append(
+            {
+                'Задача': tid,
+                'Rung': row.get('rung', 0),
+                'Инициатива': row.get('Номер инициативы', 'Без инициативы'),
+                'Команда': row.get('team_id', ''),
+                'Категория': category,
+                'Причина невыполнения': reason_text,
+            }
+        )
 
     if unscheduled:
         uns_df = pd.DataFrame(unscheduled)
-        color_map = {
-            '🔴 Дефицит специалистов': '#ffdede',
-            '🟠 Не хватает SP команды': '#ffe9c7',
-            '🟡 Ждёт зависимость': '#fff6c9',
-            '⚪ Другое': '#eeeeee',
-        }
-
-        def highlight_row(row):
-            color = color_map.get(row['Категория'], '')
-            # ВАЖНО: явно задаём тёмный цвет текста поверх светлого фона.
-            # Без этого в тёмной теме Streamlit текст по умолчанию светлый,
-            # и на пастельном фоне становится практически нечитаемым —
-            # именно это и произошло в прошлой версии.
-            return [f'background-color: {color}; color: #1a1a1a'] * len(row)
-
-        st.dataframe(uns_df.style.apply(highlight_row, axis=1), use_container_width=True)
+        st.dataframe(uns_df, use_container_width=True, hide_index=True)
     else:
-        st.success("Все задачи успешно распределены в квартал!")
+        st.success('Все задачи успешно распределены в квартал!')
 
-# Вкладка 2: НОВЫЙ ТРЕКЕР СОТРУДНИКОВ
 with tab2:
-    st.subheader("Загрузка и эффективность сотрудников (за квартал)")
-    st.write("Сводная таблица утилизации инженеров на основе списанных алгоритмом часов.")
+    st.subheader('👥 Загрузка и эффективность сотрудников')
+    st.caption('Утилизация распределяется пропорционально capacity_rate внутри одной связки «команда + роль».')
 
     emp_data = []
     for _, emp in sched.engineers_df.iterrows():
-        e_id, team, role, cap_rate = emp['engineer_id'], emp['team_id'], emp['role_norm'], emp['capacity_rate']
-
-        team_role_cap_sprint = sched.team_role_hours.get(team, {}).get(role, 0)
-        burned_for_role = c_burned.get(team, {}).get(role, 0)
+        engineer_id = emp.get('engineer_id', '')
+        team = emp.get('team_id', '')
+        role = emp.get('role_norm', '')
+        cap_rate = float(emp.get('capacity_rate', 0) or 0)
+        team_role_cap_sprint = float(sched.team_role_hours.get(team, {}).get(role, 0) or 0)
+        burned_for_role = float(c_burned.get(team, {}).get(role, 0) or 0)
+        emp_sprint_cap = max(0.0, cap_rate * 80.0)
+        emp_quarter_cap = emp_sprint_cap * 6
 
         if team_role_cap_sprint > 0:
-            emp_quarter_cap = (cap_rate * 80) * 6
-            emp_burned = burned_for_role * ((cap_rate * 80) / team_role_cap_sprint)
-            util_pct = (emp_burned / emp_quarter_cap) * 100 if emp_quarter_cap > 0 else 0
+            emp_burned = burned_for_role * emp_sprint_cap / team_role_cap_sprint
         else:
-            emp_quarter_cap = emp_burned = util_pct = 0
+            emp_burned = 0.0
+        util_pct = emp_burned / emp_quarter_cap * 100 if emp_quarter_cap > 0 else 0.0
 
-        emp_data.append({
-            'Инженер': e_id, 'Команда': team, 'Роль': role, 'Ставка': cap_rate,
-            'Доступно (ЧЧ/кв)': int(emp_quarter_cap), 'Загрузка (ЧЧ/кв)': int(emp_burned),
-            'Утилизация (%)': f"{min(100, util_pct):.1f}%"
-        })
+        emp_data.append(
+            {
+                'Инженер': engineer_id,
+                'Команда': team,
+                'Роль': role,
+                'Ставка': cap_rate,
+                'Доступно (ЧЧ/кв)': round(emp_quarter_cap, 1),
+                'Загрузка (ЧЧ/кв)': round(emp_burned, 1),
+                'Утилизация (%)': f'{min(100, max(0, util_pct)):.1f}%',
+            }
+        )
 
-    emp_df = pd.DataFrame(emp_data).sort_values(by=['Утилизация (%)', 'Команда'], ascending=[False, True])
-    st.dataframe(emp_df, use_container_width=True, height=600)
+    emp_df = pd.DataFrame(emp_data)
+    if not emp_df.empty:
+        emp_df['_util_num'] = pd.to_numeric(emp_df['Утилизация (%)'].str.rstrip('%'), errors='coerce').fillna(0)
+        emp_df = emp_df.sort_values(by=['_util_num', 'Команда'], ascending=[False, True]).drop(columns='_util_num')
+    st.dataframe(emp_df, use_container_width=True, height=600, hide_index=True)
 
-    st.markdown("---")
-    st.markdown("##### Историческая стабильность команд")
-    st.caption(
-        "Не только средняя скорость (Velocity), но и насколько предсказуемо команда "
-        "исполняла СВОЙ ЖЕ план в прошлом — две команды с одинаковым средним могут "
-        "сильно отличаться по разбросу (одна стабильна, другая скачет от спринта к спринту)."
-    )
-    st.dataframe(sched.get_team_reliability(), use_container_width=True)
+    st.markdown('---')
+    st.markdown('##### Историческая стабильность команд')
+    st.dataframe(sched.get_team_reliability(), use_container_width=True, hide_index=True)
 
-# Вкладка 3: Логи
+    if not roles_df.empty:
+        with st.expander('Роли с одним сотрудником в команде'):
+            st.dataframe(roles_df[roles_df['Кол-во сотрудников'] == 1], use_container_width=True, hide_index=True)
+
 with tab3:
     col_f1, col_f2, col_f3 = st.columns(3)
-    action_filter = col_f1.multiselect("Действие:", options=c_logs['action'].unique(),
-                                       default=['Реорганизация (Перевод)', 'Перенос'])
-    team_options = sorted(c_logs['team'].dropna().unique().tolist()) if 'team' in c_logs.columns else []
-    team_filter = col_f2.multiselect("Команда:", options=team_options)
-    init_options = sorted(c_logs['initiative'].dropna().unique().tolist()) if 'initiative' in c_logs.columns else []
-    init_filter = col_f3.multiselect("Инициатива:", options=init_options)
+    safe_actions = sorted(c_logs['action'].dropna().unique().tolist()) if not c_logs.empty else []
+    default_actions = [a for a in ['Реорганизация (Перевод)', 'Перенос'] if a in safe_actions]
+    action_filter = col_f1.multiselect('Действие:', options=safe_actions, default=default_actions)
+    team_options = sorted(c_logs['team'].dropna().astype(str).unique().tolist()) if not c_logs.empty else []
+    team_filter = col_f2.multiselect('Команда:', options=team_options)
+    init_options = sorted(c_logs['initiative'].dropna().astype(str).unique().tolist()) if not c_logs.empty else []
+    init_filter = col_f3.multiselect('Инициатива:', options=init_options)
+    search = st.text_input('Поиск по task_id:')
 
-    search = st.text_input("Поиск по task_id:")
-    f_logs = c_logs[c_logs['action'].isin(action_filter)]
-    if team_filter: f_logs = f_logs[f_logs['team'].isin(team_filter)]
-    if init_filter: f_logs = f_logs[f_logs['initiative'].isin(init_filter)]
-    if search: f_logs = f_logs[f_logs['task_id'].str.contains(search.strip(), case=False)]
-    st.dataframe(f_logs, use_container_width=True, height=400)
+    f_logs = c_logs.copy()
+    if action_filter:
+        f_logs = f_logs[f_logs['action'].isin(action_filter)]
+    if team_filter:
+        f_logs = f_logs[f_logs['team'].astype(str).isin(team_filter)]
+    if init_filter:
+        f_logs = f_logs[f_logs['initiative'].astype(str).isin(init_filter)]
+    if search.strip():
+        f_logs = f_logs[f_logs['task_id'].astype(str).str.contains(search.strip(), case=False, na=False, regex=False)]
+    st.dataframe(f_logs, use_container_width=True, height=450, hide_index=True)
 
-# Вкладка 4: Звездная карта
 with tab4:
-    st.markdown("##### Bus Factor по компании")
-    col_bf1, col_bf2 = st.columns([2, 1])
-    with col_bf1: st.dataframe(bf_df, use_container_width=True, height=400)
-    with col_bf2: st.dataframe(roles_df[roles_df['Риск'].str.contains('Высокий')], use_container_width=True)
+    with st.expander('🌍 Bus Factor по компании', expanded=True):
+        st.dataframe(bf_df, use_container_width=True, hide_index=True)
 
-    st.markdown("---")
-    st.markdown("##### Bus Factor по командам")
-    st.caption(
-        "Навык может быть не критичным для компании в целом (несколько носителей), "
-        "но критичным для КОНКРЕТНОЙ команды, если все остальные носители — в других командах."
-    )
-    bf_team_df = analytics.get_bus_factor_by_team()
-    team_filter = st.selectbox("Команда:", ["Все"] + sorted(bf_team_df['Команда'].unique().tolist()))
-    view_df = bf_team_df if team_filter == "Все" else bf_team_df[bf_team_df['Команда'] == team_filter]
-    st.dataframe(view_df[view_df['Bus Factor команды'] == 1], use_container_width=True, height=350)
-
-# Вкладка 5: Алерты
-with tab5:
-    reds = [a for a in c_alerts if '🔴' in a['type']]
-    yellows = [a for a in c_alerts if '🟡' in a['type']]
-    oranges = [a for a in c_alerts if '🟠' in a['type']]
-    c1, c2, c3 = st.columns(3)
-    c1.error(f"🔴 Срывов: {len(reds)}");
-    c2.warning(f"🟡 Сдвигов: {len(yellows)}");
-    c3.info(f"🟠 Дефицитов: {len(oranges)}")
-    for a in c_alerts:
-        if '🔴' in a['type']:
-            st.error(f"**{a['type']}** | {a['task_id']} ({a['initiative']})\n\n{a['description']}")
-        elif '🟡' in a['type']:
-            st.warning(f"**{a['type']}** | {a['task_id']} ({a['initiative']})\n\n{a['description']}")
+    with st.expander('🏢 Bus Factor по командам'):
+        if bf_team_df.empty:
+            st.info('Нет данных по командам.')
         else:
-            st.info(f"**{a['type']}** | {a['description']}")
+            selected_team = st.selectbox('Команда:', ['Все'] + sorted(bf_team_df['Команда'].dropna().astype(str).unique().tolist()))
+            view_df = bf_team_df if selected_team == 'Все' else bf_team_df[bf_team_df['Команда'] == selected_team]
+            critical = view_df[view_df['Bus Factor команды'] == 1]
+            st.dataframe(critical, use_container_width=True, hide_index=True)
+
+with tab5:
+    reds = [a for a in c_alerts if '🔴' in a.get('type', '')]
+    yellows = [a for a in c_alerts if '🟡' in a.get('type', '')]
+    oranges = [a for a in c_alerts if '🟠' in a.get('type', '')]
+    purples = [a for a in c_alerts if '🟣' in a.get('type', '')]
+    browns = [a for a in c_alerts if '🟤' in a.get('type', '')]
+
+    # 5 колонок вместо 3
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.error(f'🔴 Срывы: {len(reds)}')
+    c2.warning(f'🟡 Сдвиги: {len(yellows)}')
+    c3.info(f'🟠 Дефициты в спринте: {len(oranges)}')
+    c4.success(f'🟣 Парттайм: {len(purples)}')
+    c5.error(f'🟤 Стр. дефицит: {len(browns)}')
+
+    for alert in c_alerts:
+        text = f"**{alert.get('type', 'Алерт')}** | {alert.get('task_id', '')} ({alert.get('initiative', '')})\n\n{alert.get('description', '')}"
+        if '🔴' in alert.get('type', '') or '🟤' in alert.get('type', ''):
+            st.error(text)
+        elif '🟡' in alert.get('type', ''):
+            st.warning(text)
+        else:
+            st.info(text)
