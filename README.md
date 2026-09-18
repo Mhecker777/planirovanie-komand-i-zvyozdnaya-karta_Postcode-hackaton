@@ -1,93 +1,126 @@
-# template-gitlab-8c0dabb4
+# ПочтаТех — Квартальное планирование (PI) и Звёздная карта
 
-Template for task: GitLab репозиторий
+Сервис на Streamlit: строит выполнимый план на 6 спринтов (12 недель) с учётом ёмкости команд,
+трудозатрат по ролям и зависимостей между задачами; пересчитывает план по факту раз в 2 недели;
+считает Bus Factor и подбирает кандидатов на дообучение.
 
-## Getting started
+## Запуск
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://git.codenrock.com/codenrock/khakaton-postcode-challenge-ot-pochtatekha/template-gitlab-8c0dabb4.git
-git branch -M main
-git push -uf origin main
+```powershell
+pip install -r requirements.txt
+streamlit run app.py
 ```
 
-## Integrate with your tools
+Файл с данными должен лежать в `data/dataset.xlsx` (или `data/Датасет_с_правками_основной.xlsx` — автоопределяется).
 
-- [ ] [Set up project integrations](https://git.codenrock.com/codenrock/khakaton-postcode-challenge-ot-pochtatekha/template-gitlab-8c0dabb4/-/settings/integrations)
+## Источник данных
 
-## Collaborate with your team
+Один лист Excel, таблицы расположены друг под другом (Tasks + Калькулятор сметы, Task_dependencies,
+Engineers_profiles, Team_history). Парсер (`parser.py`) читает файл **без заголовков**
+(`header=None`) и ищет каждую секцию по позиции ячейки-маркера, а не по количеству разделителей —
+это осознанное решение: при прошлой версии на CSV именно попытка «починить» лишний `;` в заголовке
+привела к тому, что граф зависимостей был полностью пустым (подробности — в истории коммитов).
+Чтение из Excel устраняет этот класс ошибок целиком.
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+## Допущения при обработке данных (обязательно к прочтению перед оценкой корректности плана)
 
-## Test and Deploy
+1. **Ресурсная модель — по командам, с прозрачной автоматической реорганизацией.**
+   Инженер закреплён за `team_id` из `Engineers_profiles`. Если у своей команды не хватает часов
+   нужной роли, алгоритм **автоматически** ищет их у другой команды и переводит недостающий объём —
+   это и есть реализация «команды можно перестраивать». Каждый такой перевод логируется отдельным
+   действием `Реорганизация (Перевод)` с указанием роли, объёма и команды-донора — ничего не
+   происходит незаметно. SP-бюджет команды-донора при этом **не уменьшается** — считаем, что помощь
+   специалиста другой команде не отнимает у его основной команды бюджет Story Points на спринт.
+   Это допущение стоит явно обсудить с бизнесом: в реальности человек, помогающий другой команде,
+   недоступен для своей — метрика скорости донора сейчас этого не отражает.
 
-Use the built-in continuous integration in GitLab.
+2. **Зависимости — зазор минимум в 1 спринт.** Блокируемая задача не может начаться в том же
+   спринте, что и блокирующая, даже если блокирующая стала `Done` в начале того же спринта.
+   Реализовано через топологическую сортировку графа зависимостей + отметку `sprint_when_done`.
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+3. **Приоритизация внутри спринта** — задан порядок `(is_active, init_size, -rung)`:
+   сначала `InProgress`-задачи, затем задачи из инициатив с МЕНЬШИМ суммарным SP (чтобы полностью
+   закрывать небольшие инициативы быстрее — это напрямую увеличивает `PI Predictability`, который
+   считает именно полностью завершённые инициативы), затем — по убыванию `rung` (чем выше `rung`,
+   тем быстрее нужно делать задачу).
 
-***
+4. **Роли без единого сотрудника в штате** (роли «...1С», «Специалист поддержки...»,
+   «Руководитель проекта») **не учитываются** как ограничение ресурса — трудозатраты по ним не
+   блокируют завершение задачи. Причина: если по роли физически нет ни одного человека в
+   `Engineers_profiles`, любая проверка доступности для неё бессмысленна (деление на пустое
+   множество, задача была бы обречена всегда). Строка «Итого по ролям» в смете исключена из
+   расчёта по этой же причине — это агрегат, а не отдельная специальность.
 
-# Editing this README
+5. **Округление ёмкости команды** (`Velocity × 0.8`) — вниз (`int()`), то есть консервативно.
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+6. **`заказчик` / `исполнитель` / `плановый результат`** — проверено на исходном Excel: эти поля
+   заполнены одним и тем же служебным текстом почти во всех строках («6. Функционал реализован и
+   перенесён в промышленную эксплуатацию») и **не являются надёжным источником** для отображения
+   или фильтрации. Сервис их не использует. Рекомендуется уточнить у владельцев данных корректную
+   семантику этих колонок.
 
-## Suggestions for a good README
+7. **`spent_time`** — в датасете заполнено крайне непоследовательно (то `NaN`, то `0`) даже для
+   уже идущих (`InProgress`) задач, поэтому сервис **не использует** его как источник «уже
+   потраченных часов» — вся модель списания строится от общей сметы по ролям, без учёта
+   фактического расхода на старте квартала.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+8. **`estimated_hh` используется как проверка целостности, а не как источник плана.**
+   Сервис сверяет итоговую оценку задачи (`estimated_hh`) с суммой по ролям из Калькулятора сметы
+   и показывает расхождение, если оно больше 1 ЧЧ (см. вкладку «⚠️ Замечания к исходным данным» —
+   таких расхождений в датасете 33 из 45 задач). Планирование всегда идёт от постатейной сметы по
+   ролям — она детальнее и именно по ней проверяется доступность специалистов.
 
-## Name
-Choose a self-explaining name for your project.
+9. **`будет включено в спринт`** — проверено: это поле дословно совпадает с множеством уже `Done`
+   задач, похоже на артефакт заполнения задним числом, а не на плановый флаг. Не используется.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+10. **Дубли/orphan-ссылки в зависимостях** — 4 из 16 строк таблицы `Task_dependencies` ссылаются на
+    `task_id`, которых нет в основной таблице `Tasks` (`SRV-4013…SRV-4019`, кроме 4011/4012) —
+    такие связи отбрасываются автоматически (`valid_ids` фильтр), в графе остаётся 12 рёбер.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## Управляемая реорганизация (новое)
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+Автоматический перевод часов между командами (см. допущение №1) теперь не только логируется
+построчно, но и агрегируется в сводку (`get_transfer_summary`) — видно сразу, какая команда
+сколько часов какой роли отдала и кому за весь квартал. В сайдборде приложения можно запретить
+конкретный перевод (например, «Team-L не отдаёт Java-разработчиков») и пересчитать план — это
+ручной рычаг поверх автоматики, а не замена ей.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+## Алерты — обоснование (обновлено)
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+- 🔴 **Критический** — задача не стала `Done` за 12 недель.
+- 🟡 **Каскадный сдвиг** — раньше проверялся гипотетический граф (любая `InProgress`-задача с
+  потомками), из-за чего почти дублировал 🔴 по составу. Теперь — только реально зафиксированные
+  в логах блокировки: задача попала в чью-то причину переноса «Блокируется: …».
+- 🟠 **Ресурсный дефицит** — раньше один общий алерт на весь остаток бэклога квартала со
+  сравнением с фондом ОДНОГО спринта (некорректная база сравнения). Теперь — по каждому спринту
+  отдельно, на основе реально зафиксированного в момент планирования дефицита (после попытки
+  автоперевода из других команд).
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+## Историческая стабильность команд (новое)
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+`get_team_reliability()` использует ранее не читавшееся поле `planned_sp` из `Team_history`:
+сравнивает его с `velocity_achieved` за тот же исторический спринт и считает не только среднюю
+скорость команды, но и разброс исполнения её собственного плана. Порог «стабильна/нестабильна»
+(σ < 15 п.п.) подобран эмпирически на 2 исторических спринтах на команду — с таким малым размером
+выборки стоит относиться к оценке стабильности как к ориентировочной, не окончательной.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+## Say/Do Ratio — как считается
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+`Реально сделано SP / Изначально запланировано SP`. Знаменатель берётся из **первого,
+несмещённого прогона плана** (baseline, `current_time_sprint=0`) и не пересчитывается при
+внесении факта — иначе метрика тавтологична (числитель и знаменатель совпадали бы по
+построению). Числитель — сумма SP задач, которые пользователь явно подтвердил как выполненные в
+конкретном спринте через «Машину времени» в сайдбаре. Показывается средним по всем уже пройденным
+спринтам, с разбивкой по каждому — см. блок «План vs Факт» на главном экране.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+## Известные ограничения (не баги, зафиксированы для следующей итерации — см. ROADMAP)
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+- Перевод часов между командами не проверяет, не понадобятся ли эти часы донору чуть позже в том
+  же спринте для его собственной задачи (частично смягчено: доноры выбираются по убыванию остатка,
+  но полной защиты от «голодания» донора нет).
+- Реальные календарные даты (`planned_start/end`, `actual_start/end`) вычитываются парсером, но
+  планирование по-прежнему идёт в абстрактных номерах спринтов, а не в реальных датах.
+- Ресурсная модель оперирует агрегированными часами по роли, а не конкретными инженерами — теоретически
+  один и тот же человек может быть «занят» моделью в двух местах одновременно.
 
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Полный план дальнейшего развития — в `ROADMAP.md`.
