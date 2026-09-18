@@ -168,7 +168,7 @@ if current_time_sprint > 0:
                             'Задача': tid,
                             'Команда': trow['team_id'],
                             'SP': int(trow['estimation_sp']),
-                            'Завершено': False,
+                            'Завершено': True,
                         }
                     )
 
