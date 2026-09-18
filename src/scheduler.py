@@ -62,6 +62,13 @@ class SmartScheduler:
     def _warn(self, message: str):
         if message not in self.data_quality_warnings:
             self.data_quality_warnings.append(message)
+    def _engineer_has_skill(self, eng_id: str, role: str) -> bool:
+        """Проверяет, что у инженера есть хотя бы один ключевой навык для роли."""
+        required = self.role_required_skills.get(role)
+        if not required:
+            return True  # если роль не описана — не блокируем
+        eng_skills = self.engineer_skills.get(eng_id, set())
+        return bool(required & eng_skills)
 
     def _prepare_data(self):
         """Очистка, валидация и нормализация входных данных."""
@@ -184,7 +191,54 @@ class SmartScheduler:
             if hrs <= 0:
                 continue
             self.team_role_hours.setdefault(team, {})[role] = self.team_role_hours.setdefault(team, {}).get(role, 0.0) + hrs
+        # 5.1. МАППИНГ РОЛЬ -> КЛЮЧЕВЫЕ НАВЫКИ
+        # Используется для проверки технологического соответствия.
+        # Ключ — нормализованное имя роли, значение — множество ключевых слов
+        # (в нижнем регистре), которые должны встречаться в skills_declared.
+        self.role_required_skills = {
+            'Разработчик Java': {'java'},
+            'Разработчик Java Script': {'javascript', 'react', 'vue', 'angular', 'typescript'},
+            'Разработчик Android': {'android', 'kotlin'},
+            'Разработчик iOS': {'ios', 'swift'},
+            'Разработчик .net': {'.net', 'c#'},
+            'Разработчик Big Data': {'big data', 'python', 'pyspark', 'spark', 'hadoop', 'scala'},
+            'Разработчик BigData': {'big data', 'python', 'pyspark', 'spark', 'hadoop', 'scala'},
+            'Аналитик Big Data': {'big data', 'python', 'sql', 'pandas', 'tableau'},
+            'Аналитик': {'sql', 'rest api', 'bpmn', 'uml', 'json', 'xml'},
+            'Аналитик 1С': {'1с', 'sql'},
+            'Тестировщик': {'тестирование', 'rest api', 'sql', 'postman', 'devtools'},
+            'Тестировщик (Автотестирование)': {'автотест', 'selenium', 'playwright', 'pytest', 'java', 'junit'},
+            'Архитектор решений': {'архитектура', 'togaf', 'микросервисы', 'rest', 'grpc'},
+            'Архитектор 1С': {'1с'},
+            'ДевОпс': {'docker', 'kubernetes', 'ci/cd', 'linux', 'ansible', 'terraform'},
+            'Дизайнер': {'figma', 'ux', 'ui', 'adobe'},
+            'Руководитель проекта': {'agile', 'scrum', 'управление', 'bpmn'},
+            'Руководитель BigData': {'big data', 'управление', 'agile'},
+            'Специалист поддержки': {'поддержка', 'sql', 'rest api'},
+            'Специалист поддержки 1С': {'1с', 'поддержка'},
+            'Специалист поддержки BigData': {'big data', 'поддержка'},
+            'Разработчик 1С': {'1с'},
+        }
 
+        # 5.2. НАВЫКИ ИНЖЕНЕРОВ (нижний регистр)
+        self.engineer_skills = {}
+        for _, row in self.engineers_df.iterrows():
+            eng_id = row['engineer_id']
+            if not eng_id:
+                continue
+            skills_raw = str(row.get('skills_declared', ''))
+            skills = {s.strip().lower() for s in skills_raw.split(',') if s.strip()}
+            self.engineer_skills[eng_id] = skills
+
+        # 5.3. ИНЖЕНЕРЫ ПО КОМАНДАМ И РОЛЯМ
+        self.team_role_engineers = {}
+        for _, row in valid_eng.iterrows():
+            team = row['team_id']
+            role = row['role_norm']
+            eng_id = row['engineer_id']
+            if not team or not role or not eng_id:
+                continue
+            self.team_role_engineers.setdefault(team, {}).setdefault(role, set()).add(eng_id)
         # 5. СМЕТА
         self.task_estimates = defaultdict(dict)
         if self.estimates_df.empty:
@@ -285,18 +339,31 @@ class SmartScheduler:
         done_words = {'done', 'completed', 'завершена', 'завершено', 'готово', 'выполнена', 'выполнено'}
         progress_words = {'inprogress', 'in progress', 'in_progress', 'в работе', 'выполняется', 'начата', 'начато'}
         planned_words = {'planned', 'план', 'запланирована', 'запланировано', 'новая', ''}
+        canceled_words = {
+            'отменено заказ', 'отменена заказчиком', 'отменено заказчиком',
+            'отменено', 'cancelled', 'canceled',
+        }
+        not_taken_words = {
+            'не будет взято в квартал', 'не берем в квартал',
+            'не берём в квартал', 'не будет взято',
+        }
         for _, row in self.tasks.iterrows():
-            raw = row['status'].lower()
+            raw = row['status'].lower().strip()
             if raw in done_words:
                 status = 'Done'
             elif raw in progress_words:
                 status = 'InProgress'
+            elif raw in canceled_words:
+                status = 'Canceled'
+            elif raw in not_taken_words:
+                status = 'NotTaken'
             elif raw in planned_words:
                 status = 'Planned'
             else:
                 status = 'Planned'
                 unknown_status_ids.add(row['task_id'])
-                self._warn(f"{row['task_id']}: неизвестный статус «{row['status']}»; для планирования трактуется как Planned.")
+                self._warn(
+                    f"{row['task_id']}: неизвестный статус «{row['status']}»; для планирования трактуется как Planned.")
             task_status[row['task_id']] = status
 
         for t_id in self.invalid_task_ids | self.invalid_cycle_task_ids:
@@ -339,6 +406,13 @@ class SmartScheduler:
             }
             record.update(extra)
             explain_logs.append(record)
+        # Единоразово логируем отменённые и не взятые в квартал задачи.
+        for _, row in self.tasks.iterrows():
+            t_id = row['task_id']
+            if task_status.get(t_id) == 'Canceled':
+                add_log(1, row, 'Отменена', 'Задача отменена заказчиком.', 'canceled')
+            elif task_status.get(t_id) == 'NotTaken':
+                add_log(1, row, 'Не взята в квартал', 'Задача не будет взята в текущий квартал.', 'not_taken')
 
         for sprint in self.SPRINTS:
             sp_pool = {k: max(0, float(v)) for k, v in self.team_sp_capacity.items()}
@@ -346,6 +420,7 @@ class SmartScheduler:
 
             # ФАКТ прошлых спринтов: принимаем как истину, но фиксируем перерасход.
             if sprint <= current_time_sprint:
+                # 1. Фактически завершённые задачи — принимаем как истину.
                 for row in scored_tasks:
                     t_id = row['task_id']
                     if fact_sprint_done.get(t_id) != sprint:
@@ -375,6 +450,32 @@ class SmartScheduler:
                     sprint_schedule[sprint].append({'task_id': t_id, 'initiative': row['Номер инициативы'], 'team': team,
                                                     'sp': fact_sp, 'task_sp': fact_sp, 'status': 'Завершена (Факт)',
                                                     'burned_hh': burned, 'summary': row.get('summary', ''), 'rung': row.get('rung', 0)})
+
+                # 2. Задачи из baseline на этот спринт, которые НЕ закрыты в факте.
+                if baseline_schedule is not None:
+                    fact_done_ids = {t for t, s in fact_sprint_done.items() if s == sprint}
+                    seen_in_schedule = set()
+                    for item in baseline_schedule.get(sprint, []):
+                        tid = item['task_id']
+                        if tid in fact_done_ids or tid in seen_in_schedule:
+                            continue
+                        if tid not in task_rows:
+                            continue
+                        if task_status.get(tid) == 'Done':
+                            continue
+                        row = task_rows[tid]
+                        seen_in_schedule.add(tid)
+                        sprint_schedule[sprint].append({
+                            'task_id': tid,
+                            'initiative': row['Номер инициативы'],
+                            'team': row['team_id'],
+                            'sp': 0.0,
+                            'task_sp': float(row['estimation_sp']),
+                            'status': 'Не выполнена (Факт)',
+                            'burned_hh': 0.0,
+                            'summary': row.get('summary', ''),
+                            'rung': row.get('rung', 0),
+                        })
                 continue
 
             for row in scored_tasks:
@@ -383,7 +484,7 @@ class SmartScheduler:
                 initiative = row['Номер инициативы']
                 sp_needed = float(row['estimation_sp'])
 
-                if task_status.get(t_id) == 'Done':
+                if task_status.get(t_id) in {'Done', 'Canceled', 'NotTaken'}:
                     continue
                 if t_id in self.invalid_task_ids:
                     continue
@@ -423,11 +524,18 @@ class SmartScheduler:
                     if deficit <= 0:
                         continue
                     donors = []
+                    donors = []
                     for donor_team, donor_roles in temp.items():
                         if donor_team == team or (donor_team, role) in forbidden_donors:
                             continue
                         donor_avail = max(0.0, float(donor_roles.get(role, 0.0)))
                         if donor_avail > 0:
+                            # Технологическое соответствие: в команде-доноре
+                            # должен быть хотя бы один инженер с нужным навыком.
+                            donor_engineers = self.team_role_engineers.get(donor_team, {}).get(role, set())
+                            has_skill = any(self._engineer_has_skill(e, role) for e in donor_engineers)
+                            if not has_skill:
+                                continue
                             donors.append((donor_avail, donor_team))
                     for donor_avail, donor_team in sorted(donors, key=lambda x: (-x[0], x[1])):
                         if deficit <= 0:
@@ -523,7 +631,37 @@ class SmartScheduler:
                                                 'burned_hh': burned_summary, 'summary': row.get('summary', ''),
                                                 'rung': row.get('rung', 0)})
                 add_log(sprint, row, 'Включена в план', reason_text, reason_code)
-
+        # Аудит технологического соответствия: если для роли нет ни одного
+        # инженера с ключевым навыком во всей компании — задача невыполнима
+        # без найма или обучения.
+        skill_deficit_alerts = set()
+        for _, row in self.tasks.iterrows():
+            t_id = row['task_id']
+            if task_status.get(t_id) == 'Done':
+                continue
+            initiative = row['Номер инициативы']
+            req_hours = self.task_estimates.get(t_id, {})
+            for role, needed in req_hours.items():
+                if needed <= 0:
+                    continue
+                all_engineers_with_role = set()
+                for team_roles in self.team_role_engineers.values():
+                    all_engineers_with_role.update(team_roles.get(role, set()))
+                has_any = any(self._engineer_has_skill(e, role) for e in all_engineers_with_role)
+                if not has_any:
+                    key = (t_id, role)
+                    if key not in skill_deficit_alerts:
+                        skill_deficit_alerts.add(key)
+                        alerts.append({
+                            'type': '🟤 СТРУКТУРНЫЙ ДЕФИЦИТ (НАВЫКИ)',
+                            'task_id': t_id,
+                            'initiative': initiative,
+                            'description': (
+                                f"Для роли «{role}» ни у одного инженера в компании "
+                                f"нет заявленных ключевых навыков. Задача не может быть "
+                                f"выполнена без найма или обучения."
+                            )
+                        })
         # Финальный аудит SP.
         capacity_violations = []
         for sprint in self.SPRINTS:
@@ -539,12 +677,13 @@ class SmartScheduler:
                            'description': f"Команда {team}: {used_sp:.0f} SP при лимите {cap:.0f} SP."})
 
         for t_id, status in task_status.items():
-            if status not in {'Done'}:
-                row = task_rows.get(t_id)
-                if row is None:
-                    continue
-                alerts.append({'type': '🔴 КРИТИЧЕСКИЙ (Срыв инициативы)', 'task_id': t_id,
-                               'initiative': row['Номер инициативы'], 'description': f"Задача {t_id} не завершена за 6 спринтов."})
+            if status in {'Done', 'Canceled', 'NotTaken'}:
+                continue
+            row = task_rows.get(t_id)
+            if row is None:
+                continue
+            alerts.append({'type': '🔴 КРИТИЧЕСКИЙ (Срыв инициативы)', 'task_id': t_id,
+                           'initiative': row['Номер инициативы'], 'description': f"Задача {t_id} не завершена за 6 спринтов."})
 
         blocked_by_map = defaultdict(set)
         for log in explain_logs:
@@ -571,10 +710,12 @@ class SmartScheduler:
                 'description': f"Инженеры разделены между командами (менее 1.0 ставки): {', '.join(part_timers)}. Суммарное время жестко ограничено."
             })
 
-        # 🟤 СТРУКТУРНЫЙ ДЕФИЦИТ
+        # 🟤 СТРУКТУРНЫЙ ДЕФИЦИТ (роль отсутствует в команде)
         for row in scored_tasks:
             t_id = row['task_id']
             team = row['team_id']
+            if task_status.get(t_id) in {'Canceled', 'NotTaken', 'Done'}:
+                continue
             req_hours = self.task_estimates.get(t_id, {})
             for r, needed in req_hours.items():
                 if needed > 0 and r not in self.team_role_hours.get(team, {}):
@@ -583,10 +724,54 @@ class SmartScheduler:
                         'description': f"Роль «{r}» полностью отсутствует в штате команды {team}. Выполнение задачи зависит исключительно от переводов из других команд."
                     })
 
+        # 🟤 СТРУКТУРНЫЙ ДЕФИЦИТ (роль отсутствует в компании) — проверяем raw-смету,
+        # чтобы поймать роли, отфильтрованные из task_estimates (нет в known_roles).
+        if not self.estimates_df.empty:
+            first_col = self.estimates_df.columns[0]
+            reported_role_deficit = set()
+            for row in scored_tasks:
+                t_id = row['task_id']
+                initiative = row['Номер инициативы']
+                if task_status.get(t_id) in {'Canceled', 'NotTaken', 'Done'}:
+                    continue
+                if t_id not in self.estimates_df.columns:
+                    continue
+                for _, source_row in self.estimates_df.iterrows():
+                    role_name = source_row[first_col]
+                    norm_r = normalize_role_name(role_name)
+                    if norm_r in {'', 'ИТОГО'}:
+                        continue
+                    if norm_r in self.known_roles:
+                        continue
+                    val = pd.to_numeric(source_row[t_id], errors='coerce')
+                    if pd.isna(val) or val <= 0:
+                        continue
+                    key = (t_id, norm_r)
+                    if key in reported_role_deficit:
+                        continue
+                    reported_role_deficit.add(key)
+                    alerts.append({
+                        'type': '🟤 СТРУКТУРНЫЙ ДЕФИЦИТ (РОЛЬ)',
+                        'task_id': t_id,
+                        'initiative': initiative,
+                        'description': (
+                            f"Роль «{norm_r}» отсутствует в штате компании. "
+                            f"Задача не может быть выполнена без найма или перевода "
+                            f"специалиста нужного профиля."
+                        )
+                    })
+
         all_inits = self.tasks.groupby('Номер инициативы')['task_id'].apply(list).to_dict()
         valid_init_groups = {init: ids for init, ids in all_inits.items() if all(t not in self.invalid_task_ids for t in ids)}
-        completed_inits = sum(1 for ids in valid_init_groups.values() if ids and all(task_status.get(t) == 'Done' for t in ids))
-        pi_pred = completed_inits / len(valid_init_groups) * 100 if valid_init_groups else 0.0
+
+        canceled_inits = set()
+        for init, ids in valid_init_groups.items():
+            if any(task_status.get(t) in {'Canceled', 'NotTaken'} for t in ids):
+                canceled_inits.add(init)
+
+        considered_inits = {i: ids for i, ids in valid_init_groups.items() if i not in canceled_inits}
+        completed_inits = sum(1 for ids in considered_inits.values() if ids and all(task_status.get(t) == 'Done' for t in ids))
+        pi_pred = completed_inits / len(considered_inits) * 100 if considered_inits else 0.0
 
         say_do_detail = {}
         if baseline_schedule is not None and current_time_sprint > 0:
@@ -595,22 +780,33 @@ class SmartScheduler:
                 baseline_tasks_by_sprint[s] = {}
                 for item in baseline_schedule.get(s, []):
                     sp = float(item.get('sp', 0) or 0)
-                    if sp > 0:
+                    if sp > 0 and item['task_id'] not in baseline_tasks_by_sprint[s]:
                         baseline_tasks_by_sprint[s][item['task_id']] = sp
+
             for s in range(1, current_time_sprint + 1):
                 planned_tasks = baseline_tasks_by_sprint[s]
                 planned_sp = sum(planned_tasks.values())
-                done_sp = sum(sp for tid, sp in planned_tasks.items() if fact_sprint_done.get(tid) == s)
+
+                done_sp = 0.0
                 late_done_sp = 0.0
-                for tid, fact_sprint in fact_sprint_done.items():
-                    if fact_sprint != s:
+                for tid, sp in planned_tasks.items():
+                    fact_sprint = fact_sprint_done.get(tid)
+                    if fact_sprint is None:
                         continue
-                    for ps, other in baseline_tasks_by_sprint.items():
-                        if ps != s and tid in other:
-                            late_done_sp += other[tid]
-                            break
-                ratio = done_sp / planned_sp * 100 if planned_sp > 0 else 0.0
-                say_do_detail[s] = {'planned_sp': planned_sp, 'done_sp': done_sp, 'late_done_sp': late_done_sp, 'ratio': ratio}
+                    if fact_sprint == s:
+                        done_sp += sp
+                    elif fact_sprint > s:
+                        late_done_sp += sp
+
+                has_commitment = planned_sp > 0
+                ratio = (done_sp / planned_sp * 100) if has_commitment else 0.0
+                say_do_detail[s] = {
+                    'planned_sp': planned_sp,
+                    'done_sp': done_sp,
+                    'late_done_sp': late_done_sp,
+                    'ratio': ratio,
+                    'has_commitment': has_commitment,
+                }
             if say_do_detail:
                 avg = sum(v['ratio'] for v in say_do_detail.values()) / len(say_do_detail)
                 say_do_label = f"{avg:.1f}% (в среднем по {len(say_do_detail)} пройденным спринтам)"
@@ -621,8 +817,9 @@ class SmartScheduler:
 
         kpis = {
             'PI Predictability Measure': f"{pi_pred:.1f}%",
-            'Total Initiatives': len(valid_init_groups),
+            'Total Initiatives': len(considered_inits),
             'Fully Completed Initiatives': completed_inits,
+            'Canceled Initiatives': len(canceled_inits),
             'Sprint Say/Do Ratio': say_do_label,
             'Say/Do Detail': say_do_detail,
         }

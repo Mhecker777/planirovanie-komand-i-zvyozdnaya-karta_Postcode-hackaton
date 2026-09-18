@@ -16,15 +16,15 @@ class StarMapAnalytics:
         """Считает Bus Factor (по компании) и подбирает кандидатов на дообучение."""
         skill_to_engineers = {}
         eng_to_skills = {}
-        eng_to_team = {}
+        eng_to_teams = {}
 
         for _, row in self.engineers.iterrows():
             eng_id = row['engineer_id']
             team_id = row['team_id']
             orig_skills = [s.strip() for s in row['skills_declared'].split(',') if s.strip()]
 
-            eng_to_skills[eng_id] = set(orig_skills)
-            eng_to_team[eng_id] = team_id
+            eng_to_skills.setdefault(eng_id, set()).update(orig_skills)
+            eng_to_teams.setdefault(eng_id, set()).add(team_id)
             for skill in orig_skills:
                 skill_to_engineers.setdefault(skill, set()).add(eng_id)
 
@@ -35,11 +35,6 @@ class StarMapAnalytics:
 
         # ВЕС РЕДКОСТИ НАВЫКА (аналог IDF): чем меньше людей в компании владеют
         # навыком, тем больше вес совпадения по нему при подборе кандидата.
-        # Раньше совпадение считалось "в лоб" (просто число общих навыков),
-        # из-за чего общие инструментальные навыки (REST API, SQL, Git,
-        # Postman — они почти у всех) перевешивали профильные и давали
-        # нерелевантные рекомендации (пример из проверки: QA-инженера
-        # рекомендовали в Android-разработчики из-за общего "Java").
         skill_weight = {skill: 1.0 / len(eng_set) for skill, eng_set in skill_to_engineers.items()}
 
         records = []
@@ -51,7 +46,7 @@ class StarMapAnalytics:
             if bf == 1:
                 sole_owner = list(eng_set)[0]
                 owner_skills = eng_to_skills[sole_owner]
-                owner_team = eng_to_team[sole_owner]
+                owner_teams = eng_to_teams.get(sole_owner, set())
 
                 best_candidate = None
                 best_score = 0.0
@@ -59,28 +54,34 @@ class StarMapAnalytics:
                 same_team_fallback = None
 
                 for candidate, c_skills in eng_to_skills.items():
-                    if candidate == sole_owner or candidate in critical_engineers:
+                    if candidate == sole_owner:
                         continue
 
                     matched = owner_skills.intersection(c_skills)
+                    if not matched:
+                        continue
+
                     score = sum(skill_weight.get(s, 0.0) for s in matched)
+                    # Штрафуем уже критичных инженеров, чтобы не перегружать их.
+                    if candidate in critical_engineers:
+                        score *= 0.5
 
                     if score > best_score:
                         best_score = score
                         best_candidate = candidate
                         best_matched = matched
 
-                    if eng_to_team[candidate] == owner_team:
-                        same_team_fallback = candidate
+                    if same_team_fallback is None:
+                        candidate_teams = eng_to_teams.get(candidate, set())
+                        if candidate_teams & owner_teams:
+                            same_team_fallback = candidate
 
                 if best_candidate:
-                    team = eng_to_team[best_candidate]
-                    # Показываем САМИ совпавшие навыки — по ним сразу видно,
-                    # релевантна рекомендация или это случайное совпадение
-                    # по общеинструментальному навыку.
+                    teams_str = ', '.join(sorted(eng_to_teams.get(best_candidate, {''})))
                     top_matched = sorted(best_matched, key=lambda s: -skill_weight.get(s, 0.0))[:3]
                     matched_skills_note = ', '.join(top_matched)
-                    recommendation = f"💡 {best_candidate} ({team}) — похожие навыки: {matched_skills_note}"
+                    flag = '⚠️ ' if best_candidate in critical_engineers else '💡 '
+                    recommendation = f"{flag}{best_candidate} ({teams_str}) — похожие навыки: {matched_skills_note}"
                 elif same_team_fallback:
                     recommendation = f"🔄 {same_team_fallback} (из той же команды, но стек не пересекается)"
                 else:
@@ -259,53 +260,3 @@ class StarMapAnalytics:
         return result.drop(columns=['_priority'])
 
 
-    def get_star_map_data(self) -> pd.DataFrame:
-        """
-        Возвращает данные для визуальной звёздной карты.
-
-        Узлы:
-        - центр компании;
-        - технологии/компетенции.
-
-        Размер узла зависит от Bus Factor.
-        """
-        skill_to_engineers = {}
-
-        for _, row in self.engineers.iterrows():
-            eng_id = str(row['engineer_id']).strip()
-
-            skills = [
-                s.strip()
-                for s in str(row['skills_declared']).split(',')
-                if s.strip()
-            ]
-
-            for skill in skills:
-                skill_to_engineers.setdefault(skill, set()).add(eng_id)
-
-        records = []
-
-        for skill, engineers in skill_to_engineers.items():
-            bf = len(engineers)
-
-            records.append({
-                'Навык': skill,
-                'Bus Factor': bf,
-                'Специалисты': ', '.join(sorted(engineers)),
-                'Критичный': bf == 1
-            })
-
-        if not records:
-            return pd.DataFrame(
-                columns=[
-                    'Навык',
-                    'Bus Factor',
-                    'Специалисты',
-                    'Критичный'
-                ]
-            )
-
-        return pd.DataFrame(records).sort_values(
-            by=['Критичный', 'Bus Factor', 'Навык'],
-            ascending=[False, True, True]
-        )
