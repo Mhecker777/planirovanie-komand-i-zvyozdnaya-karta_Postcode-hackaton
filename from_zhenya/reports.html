@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Отчёты — TeamHub</title>
+  <link rel="stylesheet" href="css/base.css">
+  <link rel="stylesheet" href="css/layout.css">
+  <link rel="stylesheet" href="css/components.css">
+  <link rel="stylesheet" href="css/pages/reports.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="logo">TeamHub</div>
+      <nav class="nav">
+        <a href="index" class="nav-link">Главная</a>
+        <a href="#" class="nav-link">Организации</a>
+        <a href="#" class="nav-link">Команды</a>
+        <a href="#" class="nav-link">Участники</a>
+        <a href="reports" class="nav-link active">Отчёты</a>
+        <a href="#" class="nav-link">Настройки</a>
+      </nav>
+      <div class="sidebar-footer">
+        <a href="#" class="nav-link">Профиль</a>
+        <a href="login" class="nav-link">Выход</a>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <h1>Загрузка данных</h1>
+        <div class="user">Иван Иванов</div>
+      </header>
+
+      <section class="reports">
+        <div class="drop-zone" id="drop-csv">
+          <div class="drop-zone-title">CSV</div>
+          <div class="drop-zone-hint">Перетащите файл сюда или нажмите для выбора</div>
+          <input type="file" id="file-csv" accept=".csv" hidden>
+        </div>
+
+        <div class="drop-zone" id="drop-xlsx">
+          <div class="drop-zone-title">XLSX</div>
+          <div class="drop-zone-hint">Перетащите файл сюда или нажмите для выбора</div>
+          <input type="file" id="file-xlsx" accept=".xlsx,.xls" hidden>
+        </div>
+
+        <div id="status" class="status" hidden></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/pages/reports.js"></script>
+</body>
+</html>

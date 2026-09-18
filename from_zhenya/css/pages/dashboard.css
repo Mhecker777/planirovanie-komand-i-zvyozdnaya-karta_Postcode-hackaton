@@ -1,0 +1,22 @@
+.dashboard {
+  flex: 1;
+  display: flex;
+}
+
+.dashboard-placeholder {
+  flex: 1;
+  border: 2px dashed #94a3b8;
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 480px;
+}
+
+.dashboard-placeholder-label {
+  font-size: 15px;
+  color: #94a3b8;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
