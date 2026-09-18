@@ -424,26 +424,27 @@ with tab1:
             task_sprints[tid]['statuses'].append(item.get('status', ''))
             task_sprints[tid]['burned_hh'] += float(item.get('burned_hh', 0) or 0)
 
+    # Одна строка = одна задача в одном спринте. Задача с несколькими
+    # спринтами даёт несколько отдельных отрезков на диаграмме.
     gantt_records = []
-    for tid, info in task_sprints.items():
-        sprints = sorted(info['sprints'])
-        start_sprint = sprints[0]
-        end_sprint = sprints[-1]
-        start_date = sprint_date_ranges[start_sprint][0]
-        end_date = sprint_date_ranges[end_sprint][1]
-        gantt_records.append({
-            'Task': tid,
-            'Summary': info['summary'],
-            'Team': info['team'],
-            'Initiative': info['initiative'],
-            'Rung': info['rung'],
-            'Start': start_date,
-            'Finish': end_date,
-            'Sprints': ', '.join(f'Спринт {s}' for s in sprints),
-            'Statuses': ', '.join(info['statuses']),
-            'SP': info['sp'],
-            'Списано HH': round(info['burned_hh'], 1),
-        })
+    for sprint, tasks in c_schedule.items():
+        start, end = sprint_date_ranges[sprint]
+        for item in tasks:
+            gantt_records.append({
+                'Task': item['task_id'],
+                'Sprint': sprint_label(sprint),
+                'Sprint_Num': sprint,
+                'Start': start,
+                'Finish': end + timedelta(days=1),
+                'Summary': item.get('summary', ''),
+                'Team': item.get('team', ''),
+                'Initiative': item.get('initiative', 'Без инициативы'),
+                'Rung': item.get('rung', 0),
+                'Status': item.get('status', ''),
+                'SP': item.get('sp', 0),
+                'SP задачи': item.get('task_sp', item.get('sp', 0)),
+                'Списано HH': round(float(item.get('burned_hh', 0) or 0), 1),
+            })
 
     if gantt_records:
         gantt_df = pd.DataFrame(gantt_records)
@@ -454,37 +455,33 @@ with tab1:
             x_end='Finish',
             y='Task',
             color='Team',
-            hover_data=['Summary', 'Initiative', 'Rung', 'Sprints', 'Statuses', 'SP', 'Списано HH'],
+            text='Status',
+            hover_data=['Sprint', 'Initiative', 'Rung', 'SP', 'SP задачи', 'Списано HH', 'Summary'],
             title='График выполнения задач по кварталу',
         )
 
-        # Подписи спринтов по оси X
         tickvals = []
         ticktext = []
         for i in range(1, 7):
-            start, end = sprint_date_ranges[i]
-            tickvals.append(start + (end - start) / 2)
+            s, e = sprint_date_ranges[i]
+            tickvals.append(s + (e - s) / 2)
             ticktext.append(f'Спринт {i}')
 
         fig.update_layout(
-            height=max(500, min(1200, 30 * gantt_df['Task'].nunique() + 250)),
+            height=max(500, min(1400, 30 * gantt_df['Task'].nunique() + 250)),
             xaxis=dict(
                 tickmode='array',
                 tickvals=tickvals,
                 ticktext=ticktext,
                 title='Спринты квартала',
             ),
-            yaxis=dict(
-                autorange='reversed',
-                title='Задача',
-            ),
+            yaxis=dict(autorange='reversed', title='Задача'),
             legend_title='Команда',
         )
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # CSV для скачивания — оставляем, но на основе gantt_df
-        export_df = gantt_df.copy()
+        export_df = gantt_df.drop(columns=['Start', 'Finish'])
         st.download_button(
             label='📥 Скачать пересчитанный план (CSV)',
             data=export_df.to_csv(index=False, sep=';').encode('utf-8-sig'),
@@ -606,7 +603,18 @@ with tab3:
     team_filter = col_f2.multiselect('Команда:', options=team_options)
     init_options = sorted(c_logs['initiative'].dropna().astype(str).unique().tolist()) if not c_logs.empty else []
     init_filter = col_f3.multiselect('Инициатива:', options=init_options)
-    search = st.text_input('Поиск по task_id:')
+
+    col_f4, col_f5 = st.columns(2)
+    search = col_f4.text_input('Поиск по task_id:')
+    only_final = col_f5.checkbox(
+        'Показать только финальное решение по каждой задаче',
+        value=True,
+        help=(
+            'Если включено — по каждой задаче остаётся одна последняя запись. '
+            'Промежуточные «Переносы» между спринтами внутри квартала скрываются, '
+            'остаётся только итог: где задача встала в план или почему не встала вовсе.'
+        ),
+    )
 
     f_logs = c_logs.copy()
     if action_filter:
@@ -617,21 +625,169 @@ with tab3:
         f_logs = f_logs[f_logs['initiative'].astype(str).isin(init_filter)]
     if search.strip():
         f_logs = f_logs[f_logs['task_id'].astype(str).str.contains(search.strip(), case=False, na=False, regex=False)]
+
+    if only_final and not f_logs.empty:
+        # Сортируем так, чтобы последняя запись по задаче была действительно последней.
+        # Сначала по task_id, потом по sprint (NaN — в начало), потом по action.
+        sort_cols = ['task_id']
+        if 'sprint' in f_logs.columns:
+            sort_cols.append('sprint')
+        f_logs = f_logs.sort_values(sort_cols, na_position='first')
+        f_logs = f_logs.groupby('task_id', as_index=False).tail(1)
+
     st.dataframe(f_logs, use_container_width=True, height=450, hide_index=True)
 
 # ===== ВКЛАДКА 4: ЗВЁЗДНАЯ КАРТА =====
-# Вкладка 4: Звездная карта
-# Вкладка 4: Звездная карта
 with tab4:
-    with st.expander("🌍 Bus Factor по компании (Глобальный риск)", expanded=True):
-        st.dataframe(bf_df, use_container_width=True)
+    st.subheader('⭐ Звёздная карта компетенций')
+    st.caption(
+        'Карта показывает распределение навыков по командам и критичные компетенции, '
+        'которыми владеет только один инженер.'
+    )
 
-    with st.expander("🏢 Bus Factor по командам (Локальный риск)"):
-        st.caption("Навык может быть не критичным для компании в целом, но критичным для КОНКРЕТНОЙ команды.")
-        bf_team_df = analytics.get_bus_factor_by_team()
-        team_filter = st.selectbox("Команда:", ["Все"] + sorted(bf_team_df['Команда'].unique().tolist()))
-        view_df = bf_team_df if team_filter == "Все" else bf_team_df[bf_team_df['Команда'] == team_filter]
-        st.dataframe(view_df[view_df['Bus Factor команды'] == 1], use_container_width=True)
+    # ---------- Блок 1: KPI по Bus Factor ----------
+    star_df = analytics.get_star_map_data()
+    total_skills = len(star_df)
+    critical_skills = int(star_df['Критичный'].sum()) if not star_df.empty else 0
+    critical_percent = (critical_skills / total_skills * 100) if total_skills else 0.0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric('Всего навыков', total_skills)
+    c2.metric('Критичных (BF=1)', f'{critical_skills}')
+    c3.metric('Доля критичных', f'{critical_percent:.1f}%')
+
+    if critical_percent > 30:
+        st.error(
+            f'🔴 Больше трети навыков держатся на одном человеке. '
+            f'Любой отпуск или увольнение критично скажется на квартале.'
+        )
+    elif critical_percent > 15:
+        st.warning(
+            f'🟡 {critical_percent:.0f}% навыков критичны. '
+            f'Есть зоны риска — стоит запланировать дообучение.'
+        )
+    else:
+        st.success('🟢 Компания устойчива: критичных навыков немного.')
+
+    # ---------- Блок 2: Тепловая карта команды × навыки ----------
+    st.markdown('---')
+    st.markdown('##### 🌡️ Тепловая карта: навык × команда')
+    st.caption(
+        'Клетка = сколько инженеров в команде владеют навыком. '
+        'Красные клетки — критичные (только 1 человек). '
+        'Пустые клетки — навыка в команде нет вообще.'
+    )
+
+    matrix = analytics.get_team_skill_matrix()
+
+    if matrix.empty:
+        st.info('Нет данных для тепловой карты.')
+    else:
+        # Оставляем только навыки, которые есть хотя бы в одной команде
+        matrix = matrix.loc[matrix.sum(axis=1) > 0]
+
+        # Сортируем строки: сначала критичные (где минимум 1, но среднее маленькое)
+        matrix = matrix.assign(
+            _min=matrix.min(axis=1),
+            _sum=matrix.sum(axis=1),
+        ).sort_values(['_min', '_sum'], ascending=[True, True]).drop(columns=['_min', '_sum'])
+
+        # Ограничиваем до 60 навыков, иначе heatmap нечитаем
+        if matrix.shape[0] > 60:
+            st.caption(f'Показаны первые 60 навыков из {matrix.shape[0]} по критичности.')
+            matrix = matrix.head(60)
+
+        fig_heat = px.imshow(
+            matrix.values,
+            x=matrix.columns.tolist(),
+            y=matrix.index.tolist(),
+            color_continuous_scale=[
+                (0.0, '#3a0d0d'),   # 0 — тёмно-красный
+                (0.25, '#c0392b'),  # 1 — красный
+                (0.5, '#f39c12'),   # 2 — оранжевый
+                (1.0, '#27ae60'),   # 3+ — зелёный
+            ],
+            aspect='auto',
+            text_auto=True,
+        )
+        fig_heat.update_layout(
+            height=max(400, min(1400, 22 * matrix.shape[0] + 150)),
+            xaxis_title='Команда',
+            yaxis_title='Навык',
+            coloraxis_colorbar=dict(title='Инженеров'),
+        )
+        fig_heat.update_xaxes(side='top')
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+    # ---------- Блок 4: Bus Factor по компании ----------
+    with st.expander('🌍 Полная таблица Bus Factor по компании', expanded=False):
+        st.dataframe(bf_df, use_container_width=True, hide_index=True)
+
+    # ---------- Блок 5: Bus Factor по командам ----------
+    with st.expander('🏢 Bus Factor по командам (локальный риск)', expanded=False):
+        st.caption('Навык может быть не критичным для компании в целом, но критичным для КОНКРЕТНОЙ команды.')
+        bf_team_local = analytics.get_bus_factor_by_team()
+        team_filter = st.selectbox(
+            'Команда:',
+            ['Все'] + sorted(bf_team_local['Команда'].unique().tolist()),
+            key='bf_team_filter',
+        )
+        view_df = bf_team_local if team_filter == 'Все' else bf_team_local[bf_team_local['Команда'] == team_filter]
+        critical_view = view_df[view_df['Bus Factor команды'] == 1]
+        if critical_view.empty:
+            st.success('В выбранных командах критичных навыков нет.')
+        else:
+            st.dataframe(critical_view, use_container_width=True, hide_index=True)
+
+    # ---------- Блок 6: Связка критичных навыков с задачами ----------
+    with st.expander('🔗 Критичные навыки → задачи (влияние на квартал)', expanded=True):
+        st.caption(
+            'Связь «навык → задача» показывает, где отсутствие одного инженера '
+            'остановит конкретную работу. '
+            '«Прямое упоминание» — навык встречается в тексте задачи. '
+            '«Задача команды владельца» — задача в команде, где живёт единственный носитель навыка.'
+        )
+
+        skill_tasks_df = analytics.get_critical_skill_tasks(sched.tasks)
+
+        if skill_tasks_df.empty:
+            st.success('🟢 Нет критичных навыков, привязанных к задачам квартала.')
+        else:
+            # Добавим фильтр по связи
+            connection_types = sorted(skill_tasks_df['Связь'].dropna().unique().tolist())
+            picked = st.multiselect(
+                'Тип связи:',
+                options=connection_types,
+                default=connection_types,
+                key='skill_tasks_filter',
+            )
+            filtered = skill_tasks_df[skill_tasks_df['Связь'].isin(picked)]
+
+            st.dataframe(
+                filtered[['Навык', 'Владелец навыка', 'Команда владельца', 'Задача', 'Команда задачи', 'Связь']],
+                use_container_width=True,
+                hide_index=True,
+                height=min(500, 40 * len(filtered) + 60),
+            )
+
+            # KPI: сколько задач зависит от критичных навыков
+            unique_tasks_at_risk = filtered['Задача'].nunique()
+            st.caption(
+                f'⚠️ Задач под риском из-за критичных навыков: **{unique_tasks_at_risk}** '
+                f'из {sched.tasks.shape[0]} в квартале.'
+            )
+
+    # ---------- Блок 7: Роли с одним сотрудником ----------
+    with st.expander('👤 Роли с одним сотрудником в команде', expanded=False):
+        if roles_df.empty:
+            st.info('Нет данных по ролям.')
+        else:
+            single_role = roles_df[roles_df['Кол-во сотрудников'] == 1]
+            if single_role.empty:
+                st.success('Все роли в командах покрыты минимум двумя инженерами.')
+            else:
+                st.dataframe(single_role, use_container_width=True, hide_index=True)
+
 with tab5:
     reds = [a for a in c_alerts if '🔴' in a.get('type', '')]
     yellows = [a for a in c_alerts if '🟡' in a.get('type', '')]

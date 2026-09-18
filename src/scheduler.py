@@ -478,6 +478,11 @@ class SmartScheduler:
                         })
                 continue
 
+            # ============================================================
+            # ПРОХОД 1: задачи, которые команда может закрыть своими часами
+            # ============================================================
+            tasks_needing_transfer = []
+
             for row in scored_tasks:
                 t_id = row['task_id']
                 team = row['team_id']
@@ -489,7 +494,9 @@ class SmartScheduler:
                 if t_id in self.invalid_task_ids:
                     continue
                 if t_id in self.invalid_cycle_task_ids:
-                    add_log(sprint, row, 'Перенос', 'Циклическая зависимость; задача исключена из автоматического планирования.', 'dependency_cycle')
+                    add_log(sprint, row, 'Перенос',
+                            'Циклическая зависимость; задача исключена из автоматического планирования.',
+                            'dependency_cycle')
                     continue
                 if not team:
                     add_log(sprint, row, 'Перенос', 'Не указана команда задачи.', 'bad_team')
@@ -502,13 +509,70 @@ class SmartScheduler:
                     continue
 
                 if t_id in self.bad_estimate_task_ids or not remaining_hours.get(t_id):
-                    add_log(sprint, row, 'Перенос', 'Нет полной постатейной оценки по доступным ролям; задача не планируется.', 'bad_estimate')
+                    add_log(sprint, row, 'Перенос',
+                            'Нет полной постатейной оценки по доступным ролям; задача не планируется.', 'bad_estimate')
                     continue
 
                 sp_to_commit = 0.0 if t_id in reserved_sp else sp_needed
                 if sp_pool.get(team, 0) < sp_to_commit:
-                    add_log(sprint, row, 'Перенос', f"Превышен лимит SP ({sp_pool.get(team, 0):g} < {sp_to_commit:g})", 'sp_capacity')
+                    add_log(sprint, row, 'Перенос', f"Превышен лимит SP ({sp_pool.get(team, 0):g} < {sp_to_commit:g})",
+                            'sp_capacity')
                     continue
+
+                req_hours = remaining_hours[t_id]
+
+                # Проверяем, хватает ли своей команде часов на все роли
+                own_sufficient = True
+                for role, needed in req_hours.items():
+                    needed = max(0.0, float(needed))
+                    if needed <= 0:
+                        continue
+                    own = team_hours_pool.get(team, {}).get(role, 0.0)
+                    if own < needed - 1e-9:
+                        own_sufficient = False
+                        break
+
+                if not own_sufficient:
+                    tasks_needing_transfer.append(row)
+                    continue
+
+                # Своих часов хватает — планируем
+                if t_id not in reserved_sp:
+                    sp_pool[team] = max(0.0, sp_pool.get(team, 0.0) - sp_needed)
+                    reserved_sp.add(t_id)
+                    committed_sp = sp_needed
+                else:
+                    committed_sp = 0.0
+
+                burned_summary = 0.0
+                for role, needed in list(req_hours.items()):
+                    needed = max(0.0, float(needed))
+                    if needed <= 0:
+                        continue
+                    team_hours_pool.setdefault(team, {})[role] = team_hours_pool.get(team, {}).get(role, 0.0) - needed
+                    total_burned_hours[team][role] = total_burned_hours[team].get(role, 0.0) + needed
+                    remaining_hours[t_id][role] = 0.0
+                    burned_summary += needed
+
+                task_status[t_id] = 'Done'
+                sprint_when_done[t_id] = sprint
+                sprint_schedule[sprint].append({
+                    'task_id': t_id, 'initiative': initiative, 'team': team,
+                    'sp': committed_sp, 'task_sp': sp_needed, 'status': 'Завершена',
+                    'burned_hh': burned_summary, 'summary': row.get('summary', ''),
+                    'rung': row.get('rung', 0),
+                })
+                add_log(sprint, row, 'Включена в план', f"Выполнена своими силами (списано {burned_summary:.1f} ЧЧ)",
+                        'completed')
+
+            # ============================================================
+            # ПРОХОД 2: задачи, которым нужны доноры
+            # ============================================================
+            for row in tasks_needing_transfer:
+                t_id = row['task_id']
+                team = row['team_id']
+                initiative = row['Номер инициативы']
+                sp_needed = float(row['estimation_sp'])
 
                 req_hours = remaining_hours[t_id]
                 temp = {t: dict(roles) for t, roles in team_hours_pool.items()}
@@ -524,14 +588,11 @@ class SmartScheduler:
                     if deficit <= 0:
                         continue
                     donors = []
-                    donors = []
                     for donor_team, donor_roles in temp.items():
                         if donor_team == team or (donor_team, role) in forbidden_donors:
                             continue
                         donor_avail = max(0.0, float(donor_roles.get(role, 0.0)))
                         if donor_avail > 0:
-                            # Технологическое соответствие: в команде-доноре
-                            # должен быть хотя бы один инженер с нужным навыком.
                             donor_engineers = self.team_role_engineers.get(donor_team, {}).get(role, set())
                             has_skill = any(self._engineer_has_skill(e, role) for e in donor_engineers)
                             if not has_skill:
@@ -553,16 +614,14 @@ class SmartScheduler:
                         deficit_roles.append(role)
                         sprint_deficits[sprint][role] += deficit
 
-                # Частичный Split: если хоть какие-то часы доступны после переводов,
-                # выполняем доступный объём и переносим остаток в следующий спринт.
                 if deficit_roles:
-                    # При полном отсутствии ресурса по всем ролям задача не стартует.
                     total_available = 0.0
                     for role, needed in req_hours.items():
                         available = temp.get(team, {}).get(role, 0.0)
                         total_available += min(max(0.0, float(needed)), max(0.0, available))
                     if total_available <= 1e-9:
-                        add_log(sprint, row, 'Перенос', f"Глобальный дефицит специалистов: {', '.join(deficit_roles)}", 'role_capacity')
+                        add_log(sprint, row, 'Перенос', f"Глобальный дефицит специалистов: {', '.join(deficit_roles)}",
+                                'role_capacity')
                         continue
 
                 team_hours_pool = temp
@@ -589,7 +648,6 @@ class SmartScheduler:
                     req_hours[role] = max(0.0, needed - burn)
                     burned_summary += burn
 
-                    # Сначала атрибутируем burn донору, затем остаток — своей команде.
                     left = burn
                     for source in execution_sources[t_id].get(role, []):
                         source_hours = min(float(source['hours']), left)
@@ -606,19 +664,19 @@ class SmartScheduler:
                     if req_hours[role] > 1e-9:
                         fully_finished = False
 
-                # Неиспользованный перенос возвращаем донору.
                 for role, entries in execution_sources.pop(t_id, {}).items():
                     for source in entries:
                         unused = max(0.0, float(source.get('hours', 0.0)))
                         if unused > 0:
                             donor = source['team']
-                            team_hours_pool.setdefault(donor, {})[role] = team_hours_pool.get(donor, {}).get(role, 0.0) + unused
+                            team_hours_pool.setdefault(donor, {})[role] = team_hours_pool.get(donor, {}).get(role,
+                                                                                                             0.0) + unused
 
                 if fully_finished:
                     task_status[t_id] = 'Done'
                     sprint_when_done[t_id] = sprint
                     status_text = 'Завершена'
-                    reason_text = f"Выполнена (списано {burned_summary:.1f} ЧЧ)"
+                    reason_text = f"Выполнена (списано {burned_summary:.1f} ЧЧ, с переводами)"
                     reason_code = 'completed'
                 else:
                     task_status[t_id] = 'InProgress'
@@ -626,42 +684,13 @@ class SmartScheduler:
                     reason_text = f"Частично выполнена ({burned_summary:.1f} ЧЧ), остаток перенесён"
                     reason_code = 'split'
 
-                sprint_schedule[sprint].append({'task_id': t_id, 'initiative': initiative, 'team': team,
-                                                'sp': committed_sp, 'task_sp': sp_needed, 'status': status_text,
-                                                'burned_hh': burned_summary, 'summary': row.get('summary', ''),
-                                                'rung': row.get('rung', 0)})
+                sprint_schedule[sprint].append({
+                    'task_id': t_id, 'initiative': initiative, 'team': team,
+                    'sp': committed_sp, 'task_sp': sp_needed, 'status': status_text,
+                    'burned_hh': burned_summary, 'summary': row.get('summary', ''),
+                    'rung': row.get('rung', 0),
+                })
                 add_log(sprint, row, 'Включена в план', reason_text, reason_code)
-        # Аудит технологического соответствия: если для роли нет ни одного
-        # инженера с ключевым навыком во всей компании — задача невыполнима
-        # без найма или обучения.
-        skill_deficit_alerts = set()
-        for _, row in self.tasks.iterrows():
-            t_id = row['task_id']
-            if task_status.get(t_id) == 'Done':
-                continue
-            initiative = row['Номер инициативы']
-            req_hours = self.task_estimates.get(t_id, {})
-            for role, needed in req_hours.items():
-                if needed <= 0:
-                    continue
-                all_engineers_with_role = set()
-                for team_roles in self.team_role_engineers.values():
-                    all_engineers_with_role.update(team_roles.get(role, set()))
-                has_any = any(self._engineer_has_skill(e, role) for e in all_engineers_with_role)
-                if not has_any:
-                    key = (t_id, role)
-                    if key not in skill_deficit_alerts:
-                        skill_deficit_alerts.add(key)
-                        alerts.append({
-                            'type': '🟤 СТРУКТУРНЫЙ ДЕФИЦИТ (НАВЫКИ)',
-                            'task_id': t_id,
-                            'initiative': initiative,
-                            'description': (
-                                f"Для роли «{role}» ни у одного инженера в компании "
-                                f"нет заявленных ключевых навыков. Задача не может быть "
-                                f"выполнена без найма или обучения."
-                            )
-                        })
         # Финальный аудит SP.
         capacity_violations = []
         for sprint in self.SPRINTS:
