@@ -1,83 +1,93 @@
 import pandas as pd
-import io
 
 
 class DataParser:
     def __init__(self, file_path: str):
         self.file_path = file_path
-        with open(file_path, 'r', encoding='utf-8-sig') as f:
-            raw = f.read()
-
-        # Лечим опечатку в датасете: заменяем двойную точку с запятой в заголовке на одинарную
-        self.raw_data = raw.replace('blocking_task_id;;blocked_task_id', 'blocking_task_id;blocked_task_id')
+        # Читаем Excel как единую сетку без заголовков (header=None), 
+        # чтобы избежать сдвигов колонок при парсинге сложных листов
+        self.raw_df = pd.read_excel(file_path, header=None, engine='openpyxl')
 
     def _extract_section(self, header_marker: str) -> pd.DataFrame:
-        lines = self.raw_data.split('\n')
         start_idx = -1
-        end_idx = len(lines)
 
-        # 1. Ищем строку с нужными заголовками
-        for i, line in enumerate(lines):
-            if line.startswith(header_marker):
-                start_idx = i
+        # 1. Ищем номер строки, в которой находится маркер шапки
+        for idx, row in self.raw_df.iterrows():
+            row_str = row.dropna().astype(str)
+            if any(header_marker in val for val in row_str):
+                start_idx = idx
                 break
 
         if start_idx == -1:
-            raise ValueError(f"Секция с заголовком '{header_marker}' не найдена!")
+            raise ValueError(f"Секция с заголовком '{header_marker}' не найдена в Excel!")
 
-        # 2. Ищем конец секции
-        for i in range(start_idx + 1, len(lines)):
-            if lines[i].strip() == '' or lines[i].strip().startswith(';;;'):
-                end_idx = i
+        # 2. Ищем конец таблицы (первая полностью пустая строка после старта)
+        end_idx = len(self.raw_df)
+        for idx in range(start_idx + 1, len(self.raw_df)):
+            if self.raw_df.iloc[idx].dropna().empty:
+                end_idx = idx
                 break
 
-        # 3. Собираем и читаем через pandas
-        csv_str = '\n'.join(lines[start_idx:end_idx])
-        df = pd.read_csv(io.StringIO(csv_str), sep=';')
+        # 3. Вырезаем кусок сетки (только данные)
+        df_section = self.raw_df.iloc[start_idx + 1: end_idx].copy()
 
-        # 4. Удаляем мусорные пустые колонки справа
-        df = df.dropna(axis=1, how='all')
-        return df
+        # 4. Назначаем заголовки из строки start_idx
+        headers = self.raw_df.iloc[start_idx].fillna(f'Unnamed_{start_idx}').astype(str)
+        df_section.columns = headers
+
+        # 5. Очищаем от полностью пустых строк и столбцов
+        df_section = df_section.dropna(how='all', axis=0).dropna(how='all', axis=1)
+
+        return df_section
 
     def get_tasks(self) -> pd.DataFrame:
-        return self._extract_section('Номер инициативы;')
+        # Теперь парсер автоматически забирает planned_start/end, actual_start/end и estimated_hh
+        return self._extract_section('Номер инициативы')
 
     def get_estimates(self) -> pd.DataFrame:
-        return self._extract_section('Роль;')
+        return self._extract_section('Роль')
 
     def get_dependencies(self) -> pd.DataFrame:
+        # ТОТ САМЫЙ ФИКС ИЗ PDF (стр. 10): 
+        # Игнорируем реальные имена шапки, режем строго по позиции столбцов
         df = self._extract_section('blocking_task_id')
+
         clean_df = pd.DataFrame()
+        # Берем первые 2 столбца как блокер и блокируемого
+        clean_df['blocking_task_id'] = df.iloc[:, 0].astype(str).str.strip()
+        clean_df['blocked_task_id'] = df.iloc[:, 1].astype(str).str.strip()
 
-        # Проверяем, сколько колонок реально прочиталось
-        num_cols = df.shape[1]
-
-        if num_cols >= 2:
-            clean_df['blocking_task_id'] = df.iloc[:, 0].astype(str).str.strip()
-            clean_df['blocked_task_id'] = df.iloc[:, 1].astype(str).str.strip()
-        else:
-            return pd.DataFrame(columns=['blocking_task_id', 'blocked_task_id', 'dependency_type'])
-
-        # Если есть 3-я колонка с типом связи — берем её, иначе ставим 'depends on'
-        if num_cols >= 3:
+        # Если есть 3-й столбец — это тип связи, иначе ставим по умолчанию
+        if df.shape[1] >= 3:
             clean_df['dependency_type'] = df.iloc[:, 2].astype(str).str.strip()
         else:
             clean_df['dependency_type'] = 'depends on'
 
-        # Очищаем строки от мусора и пустых значений
+        # Очищаем мусор и пустые связи
         clean_df = clean_df.dropna(subset=['blocking_task_id', 'blocked_task_id'])
-        clean_df = clean_df[~clean_df['blocking_task_id'].isin(['nan', '', 'None'])]
-        clean_df = clean_df[~clean_df['blocked_task_id'].isin(['nan', '', 'None'])]
+        clean_df = clean_df[~clean_df['blocking_task_id'].isin(['nan', 'None', ''])]
+        clean_df = clean_df[~clean_df['blocked_task_id'].isin(['nan', 'None', ''])]
 
         return clean_df
 
     def get_engineers(self) -> pd.DataFrame:
-        return self._extract_section('engineer_id;')
+        return self._extract_section('engineer_id')
 
     def get_team_history(self) -> pd.DataFrame:
-        return self._extract_section('snapshot_date;')
+        # Автоматически забирает planned_sp
+        return self._extract_section('snapshot_date')
 
 
 if __name__ == "__main__":
-    parser = DataParser("../data/dataset.csv")
-    print("Зависимости исправлены:", parser.get_dependencies().columns.tolist())
+    # Тест парсера
+    # Важно: укажи правильное расширение .xlsx!
+    parser = DataParser("../data/dataset.xlsx")
+
+    deps = parser.get_dependencies()
+    print(f"✅ Зависимостей найдено: {len(deps)}")
+    print(deps.head())
+
+    tasks = parser.get_tasks()
+    print(f"✅ Задач найдено: {len(tasks)}")
+    if 'planned_start' in tasks.columns:
+        print("✅ Поля для календаря (planned_start/end) успешно загружены!")
