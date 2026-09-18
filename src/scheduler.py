@@ -572,7 +572,7 @@ class SmartScheduler:
             })
 
         # 🟤 СТРУКТУРНЫЙ ДЕФИЦИТ
-        for _, row in scored_tasks.iterrows():
+        for row in scored_tasks:
             t_id = row['task_id']
             team = row['team_id']
             req_hours = self.task_estimates.get(t_id, {})
