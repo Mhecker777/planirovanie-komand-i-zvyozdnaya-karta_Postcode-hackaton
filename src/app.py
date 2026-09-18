@@ -273,20 +273,118 @@ col4.metric('Уязвимых технологий (BF=1)', f'{critical_bf} из
 st.divider()
 
 say_do_detail = c_kpis.get('Say/Do Detail') or {}
+
 if say_do_detail:
-    with st.expander('📊 План vs Факт по пройденным спринтам', expanded=True):
+    with st.expander(
+        '📊 План vs Факт по пройденным спринтам',
+        expanded=True
+    ):
         detail_rows = [
             {
                 'Спринт': sprint_label(s),
                 'Запланировано SP (baseline)': v['planned_sp'],
                 'Сделано по факту SP': v['done_sp'],
-                'Сделано позже': v['late_done_sp'],
+                'Сделано позже': v.get('late_done_sp', 0),
                 'Say/Do': f"{v['ratio']:.1f}%",
             }
             for s, v in sorted(say_do_detail.items())
         ]
-        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
 
+        plan_fact_df = pd.DataFrame(detail_rows)
+
+        # Таблица остаётся
+        st.dataframe(
+            plan_fact_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # ==========================================================
+        # ГРАФИК ПЛАН VS ФАКТ
+        # ==========================================================
+
+        chart_records = []
+
+        for s, v in sorted(say_do_detail.items()):
+            chart_records.append({
+                'Спринт': sprint_label(s),
+                'Тип': 'План',
+                'SP': float(v['planned_sp']),
+            })
+
+            chart_records.append({
+                'Спринт': sprint_label(s),
+                'Тип': 'Факт',
+                'SP': float(v['done_sp']),
+            })
+
+        chart_df = pd.DataFrame(chart_records)
+
+        fig_plan_fact = px.bar(
+            chart_df,
+            x='Спринт',
+            y='SP',
+            color='Тип',
+            barmode='group',
+            text='SP',
+            title='План и факт Story Points по спринтам',
+        )
+
+        fig_plan_fact.update_traces(
+            texttemplate='%{text:.0f}',
+            textposition='outside',
+        )
+
+        fig_plan_fact.update_layout(
+            height=430,
+            xaxis_title='Спринт',
+            yaxis_title='Story Points',
+            legend_title='',
+            hovermode='x unified',
+        )
+
+        st.plotly_chart(
+            fig_plan_fact,
+            use_container_width=True,
+        )
+
+        # ==========================================================
+        # SAY / DO ПО СПРИНТАМ
+        # ==========================================================
+
+        say_do_chart_df = pd.DataFrame([
+            {
+                'Спринт': sprint_label(s),
+                'Say/Do (%)': float(v['ratio']),
+            }
+            for s, v in sorted(say_do_detail.items())
+        ])
+
+        fig_say_do = px.line(
+            say_do_chart_df,
+            x='Спринт',
+            y='Say/Do (%)',
+            markers=True,
+            text='Say/Do (%)',
+            title='Say/Do по завершённым спринтам',
+        )
+
+        fig_say_do.update_traces(
+            texttemplate='%{text:.1f}%',
+            textposition='top center',
+        )
+
+        fig_say_do.update_layout(
+            height=350,
+            xaxis_title='Спринт',
+            yaxis_title='Say/Do, %',
+            yaxis=dict(range=[0, 110]),
+        )
+
+        st.plotly_chart(
+            fig_say_do,
+            use_container_width=True,
+        )
 # ===== DATA QUALITY =====
 dq_warnings = sched.get_data_quality_warnings()
 if dq_warnings:
@@ -457,19 +555,19 @@ with tab3:
         f_logs = f_logs[f_logs['task_id'].astype(str).str.contains(search.strip(), case=False, na=False, regex=False)]
     st.dataframe(f_logs, use_container_width=True, height=450, hide_index=True)
 
+# ===== ВКЛАДКА 4: ЗВЁЗДНАЯ КАРТА =====
+# Вкладка 4: Звездная карта
+# Вкладка 4: Звездная карта
 with tab4:
-    with st.expander('🌍 Bus Factor по компании', expanded=True):
-        st.dataframe(bf_df, use_container_width=True, hide_index=True)
+    with st.expander("🌍 Bus Factor по компании (Глобальный риск)", expanded=True):
+        st.dataframe(bf_df, use_container_width=True)
 
-    with st.expander('🏢 Bus Factor по командам'):
-        if bf_team_df.empty:
-            st.info('Нет данных по командам.')
-        else:
-            selected_team = st.selectbox('Команда:', ['Все'] + sorted(bf_team_df['Команда'].dropna().astype(str).unique().tolist()))
-            view_df = bf_team_df if selected_team == 'Все' else bf_team_df[bf_team_df['Команда'] == selected_team]
-            critical = view_df[view_df['Bus Factor команды'] == 1]
-            st.dataframe(critical, use_container_width=True, hide_index=True)
-
+    with st.expander("🏢 Bus Factor по командам (Локальный риск)"):
+        st.caption("Навык может быть не критичным для компании в целом, но критичным для КОНКРЕТНОЙ команды.")
+        bf_team_df = analytics.get_bus_factor_by_team()
+        team_filter = st.selectbox("Команда:", ["Все"] + sorted(bf_team_df['Команда'].unique().tolist()))
+        view_df = bf_team_df if team_filter == "Все" else bf_team_df[bf_team_df['Команда'] == team_filter]
+        st.dataframe(view_df[view_df['Bus Factor команды'] == 1], use_container_width=True)
 with tab5:
     reds = [a for a in c_alerts if '🔴' in a.get('type', '')]
     yellows = [a for a in c_alerts if '🟡' in a.get('type', '')]

@@ -131,3 +131,181 @@ class StarMapAnalytics:
             lambda x: '⚠️ Высокий риск (1 сотрудник)' if x == 1 else 'Низкий'
         )
         return role_counts
+    def get_critical_skill_tasks(self, tasks_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Связывает критичные навыки (Bus Factor = 1)
+        с конкретными задачами.
+
+        Связь считается прямой, если название навыка встречается
+        в текстовых полях задачи.
+
+        Если прямого совпадения нет, дополнительно показываем
+        задачи команды единственного владельца навыка как
+        косвенную связь.
+        """
+        skill_to_engineers = {}
+        eng_to_team = {}
+
+        for _, row in self.engineers.iterrows():
+            eng_id = str(row['engineer_id']).strip()
+            team_id = str(row['team_id']).strip()
+
+            skills = [
+                s.strip()
+                for s in str(row['skills_declared']).split(',')
+                if s.strip()
+            ]
+
+            eng_to_team[eng_id] = team_id
+
+            for skill in skills:
+                skill_to_engineers.setdefault(skill, set()).add(eng_id)
+
+        critical_skills = {
+            skill: list(eng_set)[0]
+            for skill, eng_set in skill_to_engineers.items()
+            if len(eng_set) == 1
+        }
+
+        records = []
+
+        # Какие текстовые колонки задачи использовать для поиска навыка
+        preferred_text_columns = [
+            'summary',
+            'description',
+            'Описание',
+            'Наименование',
+            'Название',
+            'Задача',
+        ]
+
+        text_columns = [
+            c for c in preferred_text_columns
+            if c in tasks_df.columns
+        ]
+
+        # Если стандартных колонок нет — берём все object/string-поля
+        if not text_columns:
+            text_columns = [
+                c for c in tasks_df.columns
+                if tasks_df[c].dtype == 'object'
+            ]
+
+        for skill, owner_id in critical_skills.items():
+            owner_team = eng_to_team.get(owner_id, '')
+
+            skill_lower = skill.lower().strip()
+
+            for _, task in tasks_df.iterrows():
+                task_id = str(task.get('task_id', '')).strip()
+                task_team = str(task.get('team_id', '')).strip()
+
+                if not task_id:
+                    continue
+
+                task_text_parts = []
+
+                for column in text_columns:
+                    value = task.get(column, '')
+                    if pd.notna(value):
+                        task_text_parts.append(str(value))
+
+                task_text = ' '.join(task_text_parts).lower()
+
+                direct_match = skill_lower in task_text
+
+                same_team = task_team == owner_team
+
+                if direct_match:
+                    connection = 'Прямое упоминание навыка'
+                    priority = 1
+                elif same_team:
+                    connection = 'Задача команды владельца'
+                    priority = 2
+                else:
+                    continue
+
+                records.append({
+                    'Навык': skill,
+                    'Bus Factor': 1,
+                    'Владелец навыка': owner_id,
+                    'Команда владельца': owner_team,
+                    'Задача': task_id,
+                    'Команда задачи': task_team,
+                    'Связь': connection,
+                    '_priority': priority,
+                })
+
+        if not records:
+            return pd.DataFrame(
+                columns=[
+                    'Навык',
+                    'Bus Factor',
+                    'Владелец навыка',
+                    'Команда владельца',
+                    'Задача',
+                    'Команда задачи',
+                    'Связь'
+                ]
+            )
+
+        result = pd.DataFrame(records)
+
+        # Прямые совпадения выше косвенных
+        result = result.sort_values(
+            by=['_priority', 'Навык', 'Задача']
+        )
+
+        return result.drop(columns=['_priority'])
+
+
+    def get_star_map_data(self) -> pd.DataFrame:
+        """
+        Возвращает данные для визуальной звёздной карты.
+
+        Узлы:
+        - центр компании;
+        - технологии/компетенции.
+
+        Размер узла зависит от Bus Factor.
+        """
+        skill_to_engineers = {}
+
+        for _, row in self.engineers.iterrows():
+            eng_id = str(row['engineer_id']).strip()
+
+            skills = [
+                s.strip()
+                for s in str(row['skills_declared']).split(',')
+                if s.strip()
+            ]
+
+            for skill in skills:
+                skill_to_engineers.setdefault(skill, set()).add(eng_id)
+
+        records = []
+
+        for skill, engineers in skill_to_engineers.items():
+            bf = len(engineers)
+
+            records.append({
+                'Навык': skill,
+                'Bus Factor': bf,
+                'Специалисты': ', '.join(sorted(engineers)),
+                'Критичный': bf == 1
+            })
+
+        if not records:
+            return pd.DataFrame(
+                columns=[
+                    'Навык',
+                    'Bus Factor',
+                    'Специалисты',
+                    'Критичный'
+                ]
+            )
+
+        return pd.DataFrame(records).sort_values(
+            by=['Критичный', 'Bus Factor', 'Навык'],
+            ascending=[False, True, True]
+        )
