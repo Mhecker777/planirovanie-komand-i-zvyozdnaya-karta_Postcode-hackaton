@@ -140,7 +140,7 @@ current_time_sprint = sprint_options.index(selected_time)
 fact_sprint_done = {}
 if current_time_sprint > 0:
     st.sidebar.markdown('### ✅ Внесение факта')
-    st.sidebar.caption('Отметьте только реально завершённые задачи. По умолчанию все чекбоксы сняты.')
+    st.sidebar.caption('Отметьте только не завершённые задачи. По умолчанию все чекбоксы установлены.')
 
     all_task_ids = sched.tasks['task_id'].tolist()
     for sprint in range(1, current_time_sprint + 1):
