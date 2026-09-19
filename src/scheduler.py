@@ -450,7 +450,7 @@ class SmartScheduler:
             if row is None:
                 return (9, 0, 0, str(node))
             active = 0 if task_status.get(node) == 'InProgress' else 1
-            return (active, float(row['init_size']), -float(row['rung']), str(node))
+            return (active, -float(row['rung']), float(row['init_size']), str(node))
 
         try:
             topo_order = list(nx.lexicographical_topological_sort(self.G, key=topo_key))
