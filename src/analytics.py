@@ -1,3 +1,5 @@
+import re
+
 import pandas as pd
 from parser import DataParser
 
@@ -215,7 +217,20 @@ class StarMapAnalytics:
                         task_text_parts.append(str(value))
                 task_text = ' '.join(task_text_parts).lower()
 
-                direct_match = skill_lower in task_text
+                # ЗАЩИТА ОТ ЛОЖНЫХ СОВПАДЕНИЙ: короткие токены навыка (напр.
+                # «ТЗ», «C#», «Go») как голая подстрока могут случайно
+                # встретиться внутри произвольного текста и породить
+                # недостоверное "прямое упоминание". Для токенов короче
+                # 3 символов прямое сопоставление с текстом отключаем —
+                # для них остаётся только связь "задача команды владельца".
+                # Для остальных используем совпадение по границе слова,
+                # а не голую подстроку (иначе, например, skill "react"
+                # ложно сработает на слове "reaction").
+                if len(skill_lower) < 3:
+                    direct_match = False
+                else:
+                    pattern = r'(?<![a-zA-Zа-яА-Я0-9])' + re.escape(skill_lower) + r'(?![a-zA-Zа-яА-Я0-9])'
+                    direct_match = re.search(pattern, task_text) is not None
                 same_team = task_team == owner_team
 
                 if direct_match:
