@@ -139,63 +139,124 @@ current_time_sprint = sprint_options.index(selected_time)
 fact_sprint_done = {}
 if current_time_sprint > 0:
     st.sidebar.markdown('### ✅ Внесение факта')
-    st.sidebar.caption('Отметьте только не завершённые задачи. По умолчанию все чекбоксы установлены.')
+    st.sidebar.caption(
+        'По умолчанию все задачи, запланированные к завершению в спринте, '
+        'отмечены как завершённые. Снимите галочку с тех, что фактически '
+        'не закрылись. Задачи, которые только начались в этом спринте и '
+        'продолжаются дальше (сплиттинг), здесь не показываются — их можно '
+        'подтвердить в спринте фактического завершения.'
+    )
 
     all_task_ids = sched.tasks['task_id'].tolist()
+    task_by_id = {row['task_id']: row for _, row in sched.tasks.iterrows()}
+
+    # Финальные статусы задач: их не нужно подтверждать в факте и не нужно
+    # предлагать в пуле досрочного завершения.
+    final_statuses = {
+        'done', 'completed', 'завершена', 'завершено', 'готово',
+        'выполнена', 'выполнено',
+        'отменено заказ', 'отменена заказчиком', 'отменено заказчиком',
+        'отменено', 'cancelled', 'canceled',
+        'не будет взято в квартал', 'не берем в квартал',
+        'не берём в квартал', 'не будет взято',
+    }
+
+    def _is_actionable(tid: str) -> bool:
+        row = task_by_id.get(tid)
+        if row is None:
+            return False
+        status = str(row.get('status', '')).lower().strip()
+        return status not in final_statuses
+
+    # Задачи, впервые появляющиеся в baseline: храним спринт первого появления.
+    # Нужно для сортировки пула досрочного завершения (сначала то, что должно
+    # было начаться раньше).
+    first_appearance_sprint = {}
+    for s in sorted(b_schedule.keys()):
+        for item in b_schedule.get(s, []):
+            tid = item['task_id']
+            if tid not in first_appearance_sprint:
+                first_appearance_sprint[tid] = s
+
     for sprint in range(1, current_time_sprint + 1):
-        with st.sidebar.expander(f'Факт: {sprint_label(sprint)}', expanded=(sprint == current_time_sprint)):
-            baseline_ids = []
+        with st.sidebar.expander(
+            f'Факт: {sprint_label(sprint)}',
+            expanded=(sprint == current_time_sprint),
+        ):
+            # Задачи, которые по baseline-плану полностью завершаются именно
+            # в этом спринте. Сплитованные задачи (статус «Растянута (Сплиттинг)»)
+            # в этот список НЕ попадают — они ещё не завершаются в этом спринте.
+            planned_ids = []
             seen = set()
             for item in b_schedule.get(sprint, []):
                 tid = item['task_id']
-                if tid in all_task_ids and tid not in seen:
-                    baseline_ids.append(tid)
-                    seen.add(tid)
+                if tid in seen:
+                    continue
+                if tid not in task_by_id:
+                    continue
+                if item.get('status', '') != 'Завершена':
+                    continue
+                if not _is_actionable(tid):
+                    continue
+                seen.add(tid)
+                planned_ids.append(tid)
 
+            # Исключаем то, что уже подтверждено в предыдущих спринтах.
             prior_fact_ids = set(fact_sprint_done)
-            baseline_ids = [tid for tid in baseline_ids if tid not in prior_fact_ids]
+            planned_ids = [tid for tid in planned_ids if tid not in prior_fact_ids]
 
-            if baseline_ids:
+            if planned_ids:
                 rows = []
-                for tid in baseline_ids:
-                    matches = sched.tasks.loc[sched.tasks['task_id'] == tid]
-                    if matches.empty:
-                        continue
-                    trow = matches.iloc[0]
-                    rows.append(
-                        {
-                            'Задача': tid,
-                            'Команда': trow['team_id'],
-                            'SP': int(trow['estimation_sp']),
-                            'Завершено': True,
-                        }
-                    )
+                for tid in planned_ids:
+                    trow = task_by_id[tid]
+                    rows.append({
+                        'Задача': tid,
+                        'Команда': trow['team_id'],
+                        'SP': int(trow['estimation_sp']),
+                        'Завершено': True,  # по умолчанию — план выполнен
+                    })
 
-                if rows:
-                    edit_df = pd.DataFrame(rows)
-                    edited = st.data_editor(
-                        edit_df,
-                        column_config={'Завершено': st.column_config.CheckboxColumn('Реально завершено?')},
-                        disabled=['Задача', 'Команда', 'SP'],
-                        hide_index=True,
-                        use_container_width=True,
-                        key=f'editor_{sprint}',
-                    )
-                    selected = edited.loc[edited['Завершено'], 'Задача'].tolist()
-                else:
-                    selected = []
+                edit_df = pd.DataFrame(rows)
+                edited = st.data_editor(
+                    edit_df,
+                    column_config={
+                        'Завершено': st.column_config.CheckboxColumn('Реально завершено?'),
+                    },
+                    disabled=['Задача', 'Команда', 'SP'],
+                    hide_index=True,
+                    use_container_width=True,
+                    key=f'editor_{sprint}',
+                )
+                selected = edited.loc[edited['Завершено'], 'Задача'].tolist()
             else:
-                st.caption('На этот спринт по baseline-плану ничего не осталось для подтверждения.')
+                st.caption('На этот спринт по baseline-плану новых завершаемых задач нет.')
                 selected = []
 
-            extra_pool = [
-                tid for tid in all_task_ids
-                if tid not in baseline_ids and tid not in prior_fact_ids
-            ]
+            # Пул досрочного завершения. Сюда попадают все ещё не подтверждённые
+            # и не финальные задачи, кроме тех, что уже показаны в planned_ids:
+            #  - сплитованные задачи этого спринта (продолжение);
+            #  - задачи будущих спринтов;
+            #  - задачи, отсутствующие в baseline (например, добавленные вручную);
+            #  - просроченные задачи из прошлых спринтов, если их не подтвердили.
+            extra_pool = sorted(
+                (
+                    tid for tid in all_task_ids
+                    if tid not in planned_ids
+                    and tid not in prior_fact_ids
+                    and _is_actionable(tid)
+                ),
+                key=lambda t: (first_appearance_sprint.get(t, 999), t),
+            )
+
             extra_selected = st.multiselect(
-                'Дополнительно завершено (не было в baseline на этот спринт):',
+                'Досрочно завершено (не из этого спринта):',
                 options=extra_pool,
                 key=f'extra_{sprint}',
+                help=(
+                    'Задачи, которые по плану должны были делаться в других '
+                    'спринтах, но фактически закрыты уже сейчас. Сначала идут '
+                    'задачи, запланированные раньше.'
+                ),
             )
 
             for tid in selected + extra_selected:
