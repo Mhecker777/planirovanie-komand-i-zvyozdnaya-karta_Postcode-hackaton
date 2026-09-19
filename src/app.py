@@ -94,7 +94,6 @@ sched, analytics = load_models(DATA_PATH)
 b_schedule, b_statuses, b_logs, b_alerts, b_kpis, b_burned = load_base_plan(DATA_PATH)
 
 bf_df = analytics.get_bus_factor_and_training()
-bf_team_df = analytics.get_bus_factor_by_team()
 roles_df = analytics.get_critical_roles_shortage()
 
 # ===== КАЛЕНДАРЬ =====

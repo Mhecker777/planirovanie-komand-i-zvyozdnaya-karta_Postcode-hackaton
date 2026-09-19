@@ -49,26 +49,70 @@ def _clean_id(value):
 class SmartScheduler:
     SPRINTS = range(1, 7)
 
-    def __init__(self, data_path: str):
-        self.data_path = data_path
-        self.parser = DataParser(data_path)
-        self.raw_tasks = self.parser.get_tasks()
-        self.estimates_df = self.parser.get_estimates()
-        self.deps_df = self.parser.get_dependencies()
-        self.engineers_df = self.parser.get_engineers()
-        self.history_df = self.parser.get_team_history()
+    def __init__(self, data_path: str = None, *, tasks_df=None, estimates_df=None,
+                deps_df=None, engineers_df=None, history_df=None):
+        """
+        Два режима инициализации:
+        1) data_path — читать из Excel через DataParser (как раньше, для
+           первого запуска / сброса к исходнику).
+        2) 5 готовых DataFrame — для интеграции со слоем хранения
+           (Auth_redact.md, раздел 14.1): после правок в CRUD-интерфейсе
+           данные лежат в SQLite, а не в Excel, и должны попадать в
+           SmartScheduler напрямую, без повторного парсинга файла.
+        Второй режим требует ВСЕ пять DataFrame сразу — частичная
+        подстановка не поддерживается, чтобы не создавать рассинхронизацию
+        между, например, новыми задачами и старой сметой.
+        """
+        provided = [tasks_df, estimates_df, deps_df, engineers_df, history_df]
+        if all(df is not None for df in provided):
+            self.data_path = data_path
+            self.raw_tasks = tasks_df.copy()
+            self.estimates_df = estimates_df.copy()
+            self.deps_df = deps_df.copy()
+            self.engineers_df = engineers_df.copy()
+            self.history_df = history_df.copy()
+        elif any(df is not None for df in provided):
+            raise ValueError(
+                'Для инициализации из готовых DataFrame нужны все пять: '
+                'tasks_df, estimates_df, deps_df, engineers_df, history_df.'
+            )
+        else:
+            if not data_path:
+                raise ValueError('Нужен либо data_path, либо все пять DataFrame.')
+            self.data_path = data_path
+            self.parser = DataParser(data_path)
+            self.raw_tasks = self.parser.get_tasks()
+            self.estimates_df = self.parser.get_estimates()
+            self.deps_df = self.parser.get_dependencies()
+            self.engineers_df = self.parser.get_engineers()
+            self.history_df = self.parser.get_team_history()
         self._prepare_data()
 
     def _warn(self, message: str):
         if message not in self.data_quality_warnings:
             self.data_quality_warnings.append(message)
+
     def _engineer_has_skill(self, eng_id: str, role: str) -> bool:
-        """Проверяет, что у инженера есть хотя бы один ключевой навык для роли."""
+        """
+        Проверяет, что у инженера есть хотя бы один ключевой навык для роли.
+
+        БАГ (исправлено): раньше здесь было `required & eng_skills` — точное
+        пересечение множеств строк. Это требовало БУКВАЛЬНОГО совпадения
+        навыка целиком, а не вхождения ключевого слова как подстроки. Пример
+        реального провала: инженер с ролью «Руководитель BigData» и навыком
+        «agile/scrum» не проходил проверку по ключевому слову 'agile', потому
+        что 'agile' != 'agile/scrum' как строки, хотя по смыслу навык явно
+        присутствует. Из-за этого валидные доноры ошибочно исключались из
+        реорганизации, и алгоритм показывал дефицит специалиста, который
+        физически был доступен.
+        """
         required = self.role_required_skills.get(role)
         if not required:
             return True  # если роль не описана — не блокируем
         eng_skills = self.engineer_skills.get(eng_id, set())
-        return bool(required & eng_skills)
+        if not eng_skills:
+            return False
+        return any(any(req in sk for sk in eng_skills) for req in required)
 
     def _prepare_data(self):
         """Очистка, валидация и нормализация входных данных."""
@@ -176,12 +220,30 @@ class SmartScheduler:
         for _, row in self.engineers_df.loc[self.engineers_df['capacity_rate'] > 1].iterrows():
             self._warn(f"Инженер {row.get('engineer_id') or '?'}: capacity_rate={row['capacity_rate']:.2f} больше 1; значение сохранено как задано.")
 
-        bad_eng = (self.engineers_df['team_id'] == '') | (self.engineers_df['role_norm'] == '')
-        for _, row in self.engineers_df.loc[bad_eng].iterrows():
+        # СТАТУС ИНЖЕНЕРА (Auth_redact.md, раздел 14.2). В исходном Excel такой
+        # колонки нет — все считаются 'Активен'. Как только слой хранения
+        # (storage.py) появится, статус будет проставляться через CRUD
+        # («Управление инженерами»), и эта же логика подхватит его без
+        # дополнительных изменений в SmartScheduler.
+        if 'status' not in self.engineers_df.columns:
+            self.engineers_df['status'] = 'Активен'
+        self.engineers_df['status'] = self.engineers_df['status'].fillna('Активен').replace('', 'Активен')
+
+        fired_mask = self.engineers_df['status'] == 'Уволен'
+        temp_inactive_mask = self.engineers_df['status'].isin(['Больничный', 'Отпуск'])
+        # Уволенный — часы не считаем вообще (как будто человека нет в штате).
+        # Больничный/отпуск — человек остаётся в списках (виден в UI), но
+        # его часы на этот период равны нулю, а не исчезают из истории.
+        self.engineers_df.loc[temp_inactive_mask, 'capacity_rate'] = 0.0
+        for _, row in self.engineers_df.loc[temp_inactive_mask].iterrows():
+            self._warn(f"Инженер {row.get('engineer_id') or '?'}: статус «{row['status']}», часы на период отсутствия не учитываются.")
+
+        bad_eng = (self.engineers_df['team_id'] == '') | (self.engineers_df['role_norm'] == '') | fired_mask
+        for _, row in self.engineers_df.loc[bad_eng & ~fired_mask].iterrows():
             self._warn(f"Инженер {row.get('engineer_id') or '?'}: отсутствует команда или роль; строка не участвует в фонде часов.")
 
         self.engineers_df['hours_per_sprint'] = self.engineers_df['capacity_rate'] * 80.0
-        valid_eng = self.engineers_df[(self.engineers_df['team_id'] != '') & (self.engineers_df['role_norm'] != '')].copy()
+        valid_eng = self.engineers_df[(self.engineers_df['team_id'] != '') & (self.engineers_df['role_norm'] != '') & (~fired_mask)].copy()
         self.known_roles = set(valid_eng['role_norm']) - {''}
         self.team_role_hours = {}
         for _, row in valid_eng.iterrows():
