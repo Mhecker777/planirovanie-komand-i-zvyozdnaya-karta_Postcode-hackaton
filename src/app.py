@@ -260,139 +260,128 @@ if current_time_sprint > 0:
         'в спринте фактического завершения или вручную добавить через «Досрочно завершено».'
     )
     all_task_ids = sched.tasks['task_id'].tolist()
-        task_by_id = {row['task_id']: row for _, row in sched.tasks.iterrows()}
-        final_statuses = {
-            'done', 'completed', 'завершена', 'завершено', 'готово',
-            'выполнена', 'выполнено',
-            'отменено заказ', 'отменена заказчиком', 'отменено заказчиком',
-            'отменено', 'cancelled', 'canceled',
-            'не будет взято в квартал', 'не берем в квартал',
-            'не берём в квартал', 'не будет взято',
-        }
+    task_by_id = {row['task_id']: row for _, row in sched.tasks.iterrows()}
+    final_statuses = {
+        'done', 'completed', 'завершена', 'завершено', 'готово',
+        'выполнена', 'выполнено',
+        'отменено заказ', 'отменена заказчиком', 'отменено заказчиком',
+        'отменено', 'cancelled', 'canceled',
+        'не будет взято в квартал', 'не берем в квартал',
+        'не берём в квартал', 'не будет взято',
+    }
 
-        def _is_actionable(tid):
-            row = task_by_id.get(tid)
-            if row is None:
-                return False
-            return str(row.get('status', '')).lower().strip() not in final_statuses
 
-        first_appearance = {}
-        for s in sorted(b_schedule.keys()):
-            for item in b_schedule.get(s, []):
-                first_appearance.setdefault(item['task_id'], s)
+    def _is_actionable(tid):
+        row = task_by_id.get(tid)
+        if row is None:
+            return False
+        return str(row.get('status', '')).lower().strip() not in final_statuses
 
-        for sprint in range(1, current_time_sprint + 1):
-            with st.expander(
+
+    first_appearance = {}
+    for s in sorted(b_schedule.keys()):
+        for item in b_schedule.get(s, []):
+            first_appearance.setdefault(item['task_id'], s)
+
+    for sprint in range(1, current_time_sprint + 1):
+        with st.expander(
                 f'Факт: {sprint_label(sprint)}',
                 expanded=(sprint == current_time_sprint),
-            ):
-                planned_ids, seen = [], set()
-                for item in b_schedule.get(sprint, []):
-                    tid = item['task_id']
-                    if tid in seen or tid not in task_by_id:
-                        continue
-                    if item.get('status', '') != 'Завершена':
-                        continue
-                    if not _is_actionable(tid):
-                        continue
-                    seen.add(tid)
-                    planned_ids.append(tid)
+        ):
+            planned_ids, seen = [], set()
+            for item in b_schedule.get(sprint, []):
+                tid = item['task_id']
+                if tid in seen or tid not in task_by_id:
+                    continue
+                if item.get('status', '') != 'Завершена':
+                    continue
+                if not _is_actionable(tid):
+                    continue
+                seen.add(tid)
+                planned_ids.append(tid)
 
-                prior_fact_ids = set(fact_sprint_done)
-                planned_ids = [tid for tid in planned_ids if tid not in prior_fact_ids]
+            prior_fact_ids = set(fact_sprint_done)
+            planned_ids = [tid for tid in planned_ids if tid not in prior_fact_ids]
 
-                saved_fact = st.session_state.get('_stored_fact', {}) or {}
+            saved_fact = st.session_state.get('_stored_fact', {}) or {}
 
-                if planned_ids:
-                    rows = []
-                    for tid in planned_ids:
-                        # Логика галочки (новая):
-                        # - если задача ещё НИГДЕ не отмечена в saved_fact → по умолчанию СТОИТ
-                        #   (для sprint 1 — все стоят, для sprint 2 задача тоже стоит, пока её не тронули);
-                        # - если задача отмечена в saved_fact → стоит только если она отмечена
-                        #   именно в ТЕКУЩЕМ спринте.
-                        # Это закрывает баг: раньше после сохранения факта sprint 1 флаг
-                        # `not saved_fact` становился False, и в sprint 2 галочки не ставились.
-                        if tid not in saved_fact:
-                            checked = True
-                        else:
-                            checked = saved_fact.get(tid) == sprint
-                        rows.append({
-                            'Задача': tid,
-                            'Команда': task_by_id[tid]['team_id'],
-                            'SP': int(task_by_id[tid]['estimation_sp']),
-                            'Завершено': checked,
-                        })
-                    edit_df = pd.DataFrame(rows)
-                    edited = st.data_editor(
-                        edit_df,
-                        column_config={'Завершено': st.column_config.CheckboxColumn('Реально завершено?')},
-                        disabled=['Задача', 'Команда', 'SP'],
-                        hide_index=True, use_container_width=True,
-                        key=f'fact_editor_{sprint}',
-                    )
-                    selected = edited.loc[edited['Завершено'], 'Задача'].tolist()
-                else:
-                    st.caption('Нет новых завершаемых задач по плану на этот спринт.')
-                    selected = []
-
-                # Информационный блок: задачи, которые по baseline ПРОДОЛЖАЮТСЯ
-                # в этом спринте (были «Растянута (Сплиттинг)»). Их не нужно
-                # подтверждать — они ещё не завершаются, но полезно видеть, что
-                # происходит.
-                continuing_ids, seen_c = [], set()
-                for item in b_schedule.get(sprint, []):
-                    tid = item['task_id']
-                    if tid in seen_c or tid not in task_by_id:
-                        continue
-                    if item.get('status', '') != 'Растянута (Сплиттинг)':
-                        continue
-                    if not _is_actionable(tid):
-                        continue
-                    seen_c.add(tid)
-                    continuing_ids.append((tid, float(item.get('burned_hh', 0) or 0)))
-
-                if continuing_ids:
-                    # Вложенные expander-ы запрещены в новых версиях Streamlit,
-                    # поэтому здесь — обычный заголовок + таблица под ним.
-                    st.markdown(
-                        f'###### 🔵 Продолжающиеся задачи ({len(continuing_ids)}) — подтверждать не нужно'
-                    )
-                    st.caption(
-                        'Эти задачи не завершаются в этом спринте, они идут дальше. '
-                        'Прогресс уже учтён — в следующем спринте они возьмут остаток часов.'
-                    )
-                    cont_df = pd.DataFrame([
-                        {
-                            'Задача': tid,
-                            'Команда': task_by_id[tid]['team_id'],
-                            'SP задачи': int(task_by_id[tid]['estimation_sp']),
-                            'Списано ЧЧ (план)': burned,
-                        }
-                        for tid, burned in continuing_ids
-                    ])
-                    st.dataframe(cont_df, use_container_width=True, hide_index=True)
-                extra_pool = sorted(
-                    (tid for tid in all_task_ids
-                     if tid not in planned_ids and tid not in prior_fact_ids and _is_actionable(tid)),
-                    key=lambda t: (first_appearance.get(t, 999), t),
+            if planned_ids:
+                rows = []
+                for tid in planned_ids:
+                    if tid not in saved_fact:
+                        checked = True
+                    else:
+                        checked = saved_fact.get(tid) == sprint
+                    rows.append({
+                        'Задача': tid,
+                        'Команда': task_by_id[tid]['team_id'],
+                        'SP': int(task_by_id[tid]['estimation_sp']),
+                        'Завершено': checked,
+                    })
+                edit_df = pd.DataFrame(rows)
+                edited = st.data_editor(
+                    edit_df,
+                    column_config={'Завершено': st.column_config.CheckboxColumn('Реально завершено?')},
+                    disabled=['Задача', 'Команда', 'SP'],
+                    hide_index=True, use_container_width=True,
+                    key=f'fact_editor_{sprint}',
                 )
-                saved_extra_default = [
-                    tid for tid, s in saved_fact.items()
-                    if s == sprint and tid in extra_pool
-                ]
-                extra_selected = st.multiselect(
-                    'Досрочно завершено (не из этого спринта):',
-                    options=extra_pool,
-                    default=saved_extra_default,
-                    key=f'fact_extra_{sprint}',
-                    help='Задачи, которые по плану должны были делаться в других спринтах, '
-                         'но фактически закрыты уже сейчас.',
-                )
-                for tid in selected + extra_selected:
-                    if tid not in fact_sprint_done:
-                        fact_sprint_done[tid] = sprint
+                selected = edited.loc[edited['Завершено'], 'Задача'].tolist()
+            else:
+                st.caption('Нет новых завершаемых задач по плану на этот спринт.')
+                selected = []
 
+            continuing_ids, seen_c = [], set()
+            for item in b_schedule.get(sprint, []):
+                tid = item['task_id']
+                if tid in seen_c or tid not in task_by_id:
+                    continue
+                if item.get('status', '') != 'Растянута (Сплиттинг)':
+                    continue
+                if not _is_actionable(tid):
+                    continue
+                seen_c.add(tid)
+                continuing_ids.append((tid, float(item.get('burned_hh', 0) or 0)))
+
+            if continuing_ids:
+                st.markdown(
+                    f'###### 🔵 Продолжающиеся задачи ({len(continuing_ids)}) — подтверждать не нужно'
+                )
+                st.caption(
+                    'Эти задачи не завершаются в этом спринте, они идут дальше. '
+                    'Прогресс уже учтён — в следующем спринте они возьмут остаток часов.'
+                )
+                cont_df = pd.DataFrame([
+                    {
+                        'Задача': tid,
+                        'Команда': task_by_id[tid]['team_id'],
+                        'SP задачи': int(task_by_id[tid]['estimation_sp']),
+                        'Списано ЧЧ (план)': burned,
+                    }
+                    for tid, burned in continuing_ids
+                ])
+                st.dataframe(cont_df, use_container_width=True, hide_index=True)
+
+            extra_pool = sorted(
+                (tid for tid in all_task_ids
+                 if tid not in planned_ids and tid not in prior_fact_ids and _is_actionable(tid)),
+                key=lambda t: (first_appearance.get(t, 999), t),
+            )
+            saved_extra_default = [
+                tid for tid, s in saved_fact.items()
+                if s == sprint and tid in extra_pool
+            ]
+            extra_selected = st.multiselect(
+                'Досрочно завершено (не из этого спринта):',
+                options=extra_pool,
+                default=saved_extra_default,
+                key=f'fact_extra_{sprint}',
+                help='Задачи, которые по плану должны были делаться в других спринтах, '
+                     'но фактически закрыты уже сейчас.',
+            )
+            for tid in selected + extra_selected:
+                if tid not in fact_sprint_done:
+                    fact_sprint_done[tid] = sprint
 # ---- Сохраняем runtime-состояние на диск ----
 _current_runtime = {
     'current_time_sprint': current_time_sprint,
