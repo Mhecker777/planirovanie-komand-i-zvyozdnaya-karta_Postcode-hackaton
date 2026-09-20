@@ -358,11 +358,27 @@ def render_tasks() -> None:
         new_status = col3.selectbox('Статус', ['ToDo', 'InProgress', 'Done', 'Canceled', 'NotTaken'],
                                     key='add_task_status')
 
-        col4, col5 = st.columns(2)
+        col4, col5, col6 = st.columns(3)
         new_sp = col4.number_input('Story Points (estimation_sp)', min_value=1, value=5, step=1,
                                    key='add_task_sp')
         new_rung = col5.number_input('Приоритет rung (больше = срочнее)', min_value=0, value=50, step=10,
                                      key='add_task_rung')
+
+        # Стартовый спринт. По умолчанию — следующий после текущего,
+        # чтобы новая задача не могла попасть в уже завершённый спринт.
+        _cur_sprint = int(st.session_state.get('_stored_current_sprint') or 0)
+        _default_start = max(1, _cur_sprint + 1)
+        new_start_sprint = col6.selectbox(
+            'Стартовый спринт',
+            options=[1, 2, 3, 4, 5, 6],
+            index=_default_start - 1,
+            key='add_task_start_sprint',
+            help=(
+                f'Текущий спринт: {_cur_sprint} '
+                f'({"старт квартала" if _cur_sprint == 0 else "завершён"}). '
+                f'Задача не будет запланирована раньше выбранного спринта.'
+            ),
+        )
 
         new_summary = st.text_area(
             'Краткое описание задачи (summary)',
@@ -399,6 +415,7 @@ def render_tasks() -> None:
                     'rung': new_rung, 'status': new_status,
                     'summary': new_summary.strip(),
                     'estimated_hh': estimated_hh,
+                    'start_sprint': new_start_sprint,
                 })
                 dfs['tasks_df'] = pd.concat([tasks_df, pd.DataFrame([new_row])], ignore_index=True)
                 for numeric_col in ('estimation_sp', 'rung', 'estimated_hh'):
@@ -427,10 +444,13 @@ def render_tasks() -> None:
     if 'summary' not in tasks_df.columns:
         tasks_df['summary'] = ''
 
+    if 'start_sprint' not in tasks_df.columns:
+        tasks_df['start_sprint'] = 1
+
     display_cols = [
         c for c in [
             'task_id', 'team_id', 'Номер инициативы', 'status',
-            'rung', 'estimation_sp', 'estimated_hh', 'summary',
+            'rung', 'estimation_sp', 'estimated_hh', 'start_sprint', 'summary',
         ] if c in tasks_df.columns
     ]
     edited = st.data_editor(
@@ -448,6 +468,9 @@ def render_tasks() -> None:
             'rung': st.column_config.NumberColumn(
                 'rung', min_value=0, step=5,
                 help='Приоритет: чем больше, тем раньше задача берётся в работу.'),
+            'start_sprint': st.column_config.NumberColumn(
+                'start_sprint', min_value=1, max_value=6, step=1,
+                help='Минимальный спринт, в котором задача может быть запланирована.'),
         },
     )
     if st.button('Применить правки в таблице задач'):

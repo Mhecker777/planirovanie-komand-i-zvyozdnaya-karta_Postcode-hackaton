@@ -227,9 +227,23 @@ selected_time = st.sidebar.selectbox(
     'Выберите текущую дату:',
     sprint_options,
     index=min(auto_sprint_idx, len(sprint_options) - 1),
+    key='current_sprint_selector',
     help='По умолчанию выбран последний полностью завершившийся спринт.',
 )
 current_time_sprint = sprint_options.index(selected_time)
+
+# Сохраняем текущий спринт — data_management использует его для дефолта
+# «Стартовый спринт» при создании новой задачи, чтобы новая задача не могла
+# попасть в уже завершённый спринт.
+st.session_state['_stored_current_sprint'] = current_time_sprint
+# ---- Баннер «Текущий спринт» ----
+if current_time_sprint > 0:
+    st.info(
+        f'📅 **Текущий спринт:** {sprint_label(current_time_sprint)} — завершён. '
+        f'Новые задачи будут запланированы не раньше Спринта {current_time_sprint + 1}.'
+    )
+else:
+    st.info('📅 **Текущий спринт:** Старт квартала. Все 6 спринтов впереди.')
 # ===== ФАКТ (в main, до валидации зависимостей) =====
 fact_sprint_done = {}
 if current_time_sprint > 0:
@@ -287,12 +301,14 @@ if current_time_sprint > 0:
                 if planned_ids:
                     rows = []
                     for tid in planned_ids:
-                        # Логика галочки:
-                        # - если пользователь ещё ничего не сохранял (saved_fact пусто) — по умолчанию СТОИТ;
-                        # - если пользователь уже отмечал факт (saved_fact не пусто) — стоит только у тех,
-                        #   у кого в сохранённом факте указан именно этот спринт. То есть снятые галочки
-                        #   остаются снятыми при перезагрузке.
-                        if not saved_fact:
+                        # Логика галочки (новая):
+                        # - если задача ещё НИГДЕ не отмечена в saved_fact → по умолчанию СТОИТ
+                        #   (для sprint 1 — все стоят, для sprint 2 задача тоже стоит, пока её не тронули);
+                        # - если задача отмечена в saved_fact → стоит только если она отмечена
+                        #   именно в ТЕКУЩЕМ спринте.
+                        # Это закрывает баг: раньше после сохранения факта sprint 1 флаг
+                        # `not saved_fact` становился False, и в sprint 2 галочки не ставились.
+                        if tid not in saved_fact:
                             checked = True
                         else:
                             checked = saved_fact.get(tid) == sprint
