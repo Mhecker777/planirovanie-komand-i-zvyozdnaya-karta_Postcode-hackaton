@@ -348,24 +348,25 @@ if current_time_sprint > 0:
                     continuing_ids.append((tid, float(item.get('burned_hh', 0) or 0)))
 
                 if continuing_ids:
-                    with st.expander(
-                        f'🔵 Продолжающиеся задачи ({len(continuing_ids)}) — подтверждать не нужно',
-                        expanded=False,
-                    ):
-                        st.caption(
-                            'Эти задачи не завершаются в этом спринте, они идут дальше. '
-                            'Прогресс уже учтён — в следующем спринте они возьмут остаток часов.'
-                        )
-                        cont_df = pd.DataFrame([
-                            {
-                                'Задача': tid,
-                                'Команда': task_by_id[tid]['team_id'],
-                                'SP задачи': int(task_by_id[tid]['estimation_sp']),
-                                'Списано ЧЧ (план)': burned,
-                            }
-                            for tid, burned in continuing_ids
-                        ])
-                        st.dataframe(cont_df, use_container_width=True, hide_index=True)
+                    # Вложенные expander-ы запрещены в новых версиях Streamlit,
+                    # поэтому здесь — обычный заголовок + таблица под ним.
+                    st.markdown(
+                        f'###### 🔵 Продолжающиеся задачи ({len(continuing_ids)}) — подтверждать не нужно'
+                    )
+                    st.caption(
+                        'Эти задачи не завершаются в этом спринте, они идут дальше. '
+                        'Прогресс уже учтён — в следующем спринте они возьмут остаток часов.'
+                    )
+                    cont_df = pd.DataFrame([
+                        {
+                            'Задача': tid,
+                            'Команда': task_by_id[tid]['team_id'],
+                            'SP задачи': int(task_by_id[tid]['estimation_sp']),
+                            'Списано ЧЧ (план)': burned,
+                        }
+                        for tid, burned in continuing_ids
+                    ])
+                    st.dataframe(cont_df, use_container_width=True, hide_index=True)
                 extra_pool = sorted(
                     (tid for tid in all_task_ids
                      if tid not in planned_ids and tid not in prior_fact_ids and _is_actionable(tid)),
