@@ -17,6 +17,10 @@ for import_dir in (CURRENT_DIR, src_dir, PROJECT_ROOT):
     if import_dir not in sys.path:
         sys.path.insert(0, import_dir)
 
+import auth
+import data_management
+from storage import StateStorage
+from parser import DataParser
 from scheduler import SmartScheduler
 from analytics import StarMapAnalytics
 
@@ -75,34 +79,79 @@ def resolve_data_path() -> str:
 
 
 DATA_PATH = resolve_data_path()
+DB_PATH = os.path.join(os.path.dirname(DATA_PATH), 'state.db')
 
 
 @st.cache_resource(show_spinner=False)
-def load_models(data_path: str):
-    sched = SmartScheduler(data_path)
-    analytics = StarMapAnalytics(data_path)
-    return sched, analytics
+def get_storage(db_path: str) -> StateStorage:
+    return StateStorage(db_path)
 
 
-@st.cache_data(show_spinner=False)
-def load_base_plan(data_path: str):
-    sched = SmartScheduler(data_path)
-    return sched.run_smart_planning()
+storage = get_storage(DB_PATH)
+# ---- Восстанавливаем runtime-состояние из предыдущей сессии ----
+if not st.session_state.get('_runtime_loaded'):
+    _stored_runtime = storage.load_runtime()
+    st.session_state['_stored_current_sprint'] = _stored_runtime.get('current_time_sprint')
+    st.session_state['_stored_fact'] = _stored_runtime.get('fact_sprint_done', {}) or {}
+    st.session_state['_stored_quarter_start_iso'] = _stored_runtime.get('quarter_start_value')
+    st.session_state['_runtime_loaded'] = True
+st.session_state['storage'] = storage  # чтобы auth.require_permission мог найти его
 
+user = auth.get_current_user()
 
-sched, analytics = load_models(DATA_PATH)
-b_schedule, b_statuses, b_logs, b_alerts, b_kpis, b_burned = load_base_plan(DATA_PATH)
+if not st.session_state.get('_session_logged'):
+    storage.log_session(user, 'login')
+    st.session_state['_session_logged'] = True
 
-bf_df = analytics.get_bus_factor_and_training()
-roles_df = analytics.get_critical_roles_shortage()
+# ---- Загрузка/восстановление состояния ----
+# working_dfs — рабочая копия, которую редактирует «Управление данными»;
+# правки видны сразу во всех вкладках плана, но не переживают перезапуск,
+# пока не нажата «Сохранить» (тогда попадают в committed_dfs и в SQLite).
+if 'working_dfs' not in st.session_state:
+    restored = storage.load_latest()
+    if restored is not None:
+        dfs, version = restored
+    else:
+        parser = DataParser(DATA_PATH)
+        dfs = {
+            'tasks_df': parser.get_tasks(), 'estimates_df': parser.get_estimates(),
+            'deps_df': parser.get_dependencies(), 'engineers_df': parser.get_engineers(),
+            'history_df': parser.get_team_history(),
+        }
+        version = storage.save_snapshot(dfs, user=auth.DEFAULT_USER, comment='Первичная загрузка из dataset.xlsx')
+    st.session_state['working_dfs'] = dfs
+    st.session_state['committed_dfs'] = {k: v.copy() for k, v in dfs.items()}
+    st.session_state['committed_version'] = version
+    st.session_state['pending_changes'] = []
+    st.session_state['dirty'] = False
 
-# ===== КАЛЕНДАРЬ =====
+# ===== КАЛЕНДАРЬ: инициализация + виджет + вычисления =====
+if 'quarter_start_value' not in st.session_state:
+    restored_iso = st.session_state.get('_stored_quarter_start_iso')
+    if restored_iso:
+        try:
+            st.session_state['quarter_start_value'] = pd.to_datetime(restored_iso).date()
+        except (ValueError, TypeError):
+            st.session_state['quarter_start_value'] = (
+                date.today() - timedelta(days=date.today().weekday())
+            )
+    else:
+        st.session_state['quarter_start_value'] = (
+            date.today() - timedelta(days=date.today().weekday())
+        )
+st.sidebar.markdown('---')
 st.sidebar.header('📅 Календарь квартала')
-default_quarter_start = date.today() - timedelta(days=date.today().weekday())
-quarter_start = st.sidebar.date_input(
+_new_quarter_start = st.sidebar.date_input(
     'Дата старта квартала (Спринт 1):',
-    value=default_quarter_start,
+    value=st.session_state['quarter_start_value'],
+    key='quarter_start_input',
 )
+
+if _new_quarter_start != st.session_state['quarter_start_value']:
+    st.session_state['quarter_start_value'] = _new_quarter_start
+    st.rerun()
+
+quarter_start = st.session_state['quarter_start_value']
 
 sprint_date_ranges = {
     i: (
@@ -118,172 +167,19 @@ def sprint_label(i: int) -> str:
     return f'Спринт {i} ({start:%d.%m}–{end:%d.%m})'
 
 
-today = date.today()
-auto_sprint_idx = 0
-for i in range(1, 7):
-    if today > sprint_date_ranges[i][1]:
-        auto_sprint_idx = i
+sprint_dates_for_sched = {i: sprint_date_ranges[i] for i in range(1, 7)}
 
-st.sidebar.markdown('---')
-st.sidebar.header('⏳ Симуляция времени (Факт)')
-sprint_options = ['Старт квартала (Спринт 0)'] + [f'Завершен {sprint_label(i)}' for i in range(1, 7)]
-selected_time = st.sidebar.selectbox(
-    'Выберите текущую дату:',
-    sprint_options,
-    index=min(auto_sprint_idx, len(sprint_options) - 1),
-    help='По умолчанию выбран последний полностью завершившийся спринт.',
-)
-current_time_sprint = sprint_options.index(selected_time)
+# ===== ПЛАНИРОВЩИКИ =====
+working_dfs = st.session_state['working_dfs']
+committed_dfs = st.session_state['committed_dfs']
 
-# ===== ФАКТ =====
-fact_sprint_done = {}
-if current_time_sprint > 0:
-    st.sidebar.markdown('### ✅ Внесение факта')
-    st.sidebar.caption(
-        'По умолчанию все задачи, запланированные к завершению в спринте, '
-        'отмечены как завершённые. Снимите галочку с тех, что фактически '
-        'не закрылись. Задачи, которые только начались в этом спринте и '
-        'продолжаются дальше (сплиттинг), здесь не показываются — их можно '
-        'подтвердить в спринте фактического завершения.'
-    )
+sched = SmartScheduler(**working_dfs, sprint_dates=sprint_dates_for_sched)
+analytics = StarMapAnalytics(engineers_df=working_dfs['engineers_df'])
+baseline_sched = SmartScheduler(**committed_dfs, sprint_dates=sprint_dates_for_sched)
+b_schedule, b_statuses, b_logs, b_alerts, b_kpis, b_burned = baseline_sched.run_smart_planning()
 
-    all_task_ids = sched.tasks['task_id'].tolist()
-    task_by_id = {row['task_id']: row for _, row in sched.tasks.iterrows()}
-
-    # Финальные статусы задач: их не нужно подтверждать в факте и не нужно
-    # предлагать в пуле досрочного завершения.
-    final_statuses = {
-        'done', 'completed', 'завершена', 'завершено', 'готово',
-        'выполнена', 'выполнено',
-        'отменено заказ', 'отменена заказчиком', 'отменено заказчиком',
-        'отменено', 'cancelled', 'canceled',
-        'не будет взято в квартал', 'не берем в квартал',
-        'не берём в квартал', 'не будет взято',
-    }
-
-    def _is_actionable(tid: str) -> bool:
-        row = task_by_id.get(tid)
-        if row is None:
-            return False
-        status = str(row.get('status', '')).lower().strip()
-        return status not in final_statuses
-
-    # Задачи, впервые появляющиеся в baseline: храним спринт первого появления.
-    # Нужно для сортировки пула досрочного завершения (сначала то, что должно
-    # было начаться раньше).
-    first_appearance_sprint = {}
-    for s in sorted(b_schedule.keys()):
-        for item in b_schedule.get(s, []):
-            tid = item['task_id']
-            if tid not in first_appearance_sprint:
-                first_appearance_sprint[tid] = s
-
-    for sprint in range(1, current_time_sprint + 1):
-        with st.sidebar.expander(
-            f'Факт: {sprint_label(sprint)}',
-            expanded=(sprint == current_time_sprint),
-        ):
-            # Задачи, которые по baseline-плану полностью завершаются именно
-            # в этом спринте. Сплитованные задачи (статус «Растянута (Сплиттинг)»)
-            # в этот список НЕ попадают — они ещё не завершаются в этом спринте.
-            planned_ids = []
-            seen = set()
-            for item in b_schedule.get(sprint, []):
-                tid = item['task_id']
-                if tid in seen:
-                    continue
-                if tid not in task_by_id:
-                    continue
-                if item.get('status', '') != 'Завершена':
-                    continue
-                if not _is_actionable(tid):
-                    continue
-                seen.add(tid)
-                planned_ids.append(tid)
-
-            # Исключаем то, что уже подтверждено в предыдущих спринтах.
-            prior_fact_ids = set(fact_sprint_done)
-            planned_ids = [tid for tid in planned_ids if tid not in prior_fact_ids]
-
-            if planned_ids:
-                rows = []
-                for tid in planned_ids:
-                    trow = task_by_id[tid]
-                    rows.append({
-                        'Задача': tid,
-                        'Команда': trow['team_id'],
-                        'SP': int(trow['estimation_sp']),
-                        'Завершено': True,  # по умолчанию — план выполнен
-                    })
-
-                edit_df = pd.DataFrame(rows)
-                edited = st.data_editor(
-                    edit_df,
-                    column_config={
-                        'Завершено': st.column_config.CheckboxColumn('Реально завершено?'),
-                    },
-                    disabled=['Задача', 'Команда', 'SP'],
-                    hide_index=True,
-                    use_container_width=True,
-                    key=f'editor_{sprint}',
-                )
-                selected = edited.loc[edited['Завершено'], 'Задача'].tolist()
-            else:
-                st.caption('На этот спринт по baseline-плану новых завершаемых задач нет.')
-                selected = []
-
-            # Пул досрочного завершения. Сюда попадают все ещё не подтверждённые
-            # и не финальные задачи, кроме тех, что уже показаны в planned_ids:
-            #  - сплитованные задачи этого спринта (продолжение);
-            #  - задачи будущих спринтов;
-            #  - задачи, отсутствующие в baseline (например, добавленные вручную);
-            #  - просроченные задачи из прошлых спринтов, если их не подтвердили.
-            extra_pool = sorted(
-                (
-                    tid for tid in all_task_ids
-                    if tid not in planned_ids
-                    and tid not in prior_fact_ids
-                    and _is_actionable(tid)
-                ),
-                key=lambda t: (first_appearance_sprint.get(t, 999), t),
-            )
-
-            extra_selected = st.multiselect(
-                'Досрочно завершено (не из этого спринта):',
-                options=extra_pool,
-                key=f'extra_{sprint}',
-                help=(
-                    'Задачи, которые по плану должны были делаться в других '
-                    'спринтах, но фактически закрыты уже сейчас. Сначала идут '
-                    'задачи, запланированные раньше.'
-                ),
-            )
-
-            for tid in selected + extra_selected:
-                if tid not in fact_sprint_done:
-                    fact_sprint_done[tid] = sprint
-
-# Валидация фактических зависимостей
-fact_dependency_warnings = []
-for task_id, done_sprint in fact_sprint_done.items():
-    if task_id not in sched.G:
-        continue
-    for predecessor in sched.G.predecessors(task_id):
-        predecessor_sprint = fact_sprint_done.get(predecessor)
-        if predecessor_sprint is None:
-            fact_dependency_warnings.append(
-                f'{task_id} отмечена завершённой в Спринте {done_sprint}, но зависимость {predecessor} в факте не завершена.'
-            )
-        elif predecessor_sprint >= done_sprint:
-            fact_dependency_warnings.append(
-                f'{task_id} отмечена в Спринте {done_sprint}, но зависимость {predecessor} завершена в Спринте {predecessor_sprint}.'
-            )
-
-if fact_dependency_warnings:
-    st.sidebar.warning('⚠️ Обнаружены нарушения фактических зависимостей')
-    with st.sidebar.expander(f'Показать нарушения ({len(fact_dependency_warnings)})'):
-        for warning in fact_dependency_warnings:
-            st.caption(f'• {warning}')
+bf_df = analytics.get_bus_factor_and_training()
+roles_df = analytics.get_critical_roles_shortage()
 
 # ===== УПРАВЛЯЕМАЯ РЕОРГАНИЗАЦИЯ =====
 st.sidebar.markdown('---')
@@ -292,7 +188,8 @@ transfer_summary = sched.get_transfer_summary(b_logs)
 forbidden_donors = set()
 if not transfer_summary.empty:
     st.sidebar.caption(
-        'Алгоритм показывает автоматические переводы из baseline. Вы можете запретить конкретную связку «донор + роль» и пересчитать план.'
+        'Алгоритм показывает автоматические переводы из baseline. '
+        'Вы можете запретить конкретную связку «донор + роль» и пересчитать план.'
     )
     ts = transfer_summary.copy()
     ts['_key'] = ts['Команда-донор'].astype(str) + ' отдаёт «' + ts['Роль'].astype(str) + '»'
@@ -305,6 +202,252 @@ if not transfer_summary.empty:
         st.dataframe(transfer_summary, use_container_width=True, hide_index=True)
 else:
     st.sidebar.caption('В baseline-плане переводов между командами не потребовалось.')
+
+# ===== ВЫБОР ТЕКУЩЕГО СПРИНТА =====
+today = date.today()
+auto_sprint_idx = 0
+for i in range(1, 7):
+    if today > sprint_date_ranges[i][1]:
+        auto_sprint_idx = i
+
+# Восстанавливаем из runtime, если пользователь уже выбирал спринт.
+saved_sprint = st.session_state.get('_stored_current_sprint')
+if saved_sprint is not None:
+    try:
+        auto_sprint_idx = max(0, min(6, int(saved_sprint)))
+    except (ValueError, TypeError):
+        pass
+
+st.sidebar.markdown('---')
+st.sidebar.header('⏳ Симуляция времени (Факт)')
+sprint_options = ['Старт квартала (Спринт 0)'] + [
+    f'Завершен {sprint_label(i)}' for i in range(1, 7)
+]
+selected_time = st.sidebar.selectbox(
+    'Выберите текущую дату:',
+    sprint_options,
+    index=min(auto_sprint_idx, len(sprint_options) - 1),
+    help='По умолчанию выбран последний полностью завершившийся спринт.',
+)
+current_time_sprint = sprint_options.index(selected_time)
+# ===== ФАКТ (в main, до валидации зависимостей) =====
+fact_sprint_done = {}
+if current_time_sprint > 0:
+    with st.expander('✅ Внесение факта по завершённым спринтам', expanded=False):
+        st.caption(
+            'По умолчанию все задачи, запланированные к завершению в спринте, '
+            'отмечены как завершённые. Снимите галочку с тех, что фактически не закрылись. '
+            'Продолжающиеся задачи (сплиттинг) здесь не показываются — их можно подтвердить '
+            'в спринте фактического завершения или вручную добавить через «Досрочно завершено».'
+        )
+        all_task_ids = sched.tasks['task_id'].tolist()
+        task_by_id = {row['task_id']: row for _, row in sched.tasks.iterrows()}
+        final_statuses = {
+            'done', 'completed', 'завершена', 'завершено', 'готово',
+            'выполнена', 'выполнено',
+            'отменено заказ', 'отменена заказчиком', 'отменено заказчиком',
+            'отменено', 'cancelled', 'canceled',
+            'не будет взято в квартал', 'не берем в квартал',
+            'не берём в квартал', 'не будет взято',
+        }
+
+        def _is_actionable(tid):
+            row = task_by_id.get(tid)
+            if row is None:
+                return False
+            return str(row.get('status', '')).lower().strip() not in final_statuses
+
+        first_appearance = {}
+        for s in sorted(b_schedule.keys()):
+            for item in b_schedule.get(s, []):
+                first_appearance.setdefault(item['task_id'], s)
+
+        for sprint in range(1, current_time_sprint + 1):
+            with st.expander(
+                f'Факт: {sprint_label(sprint)}',
+                expanded=(sprint == current_time_sprint),
+            ):
+                planned_ids, seen = [], set()
+                for item in b_schedule.get(sprint, []):
+                    tid = item['task_id']
+                    if tid in seen or tid not in task_by_id:
+                        continue
+                    if item.get('status', '') != 'Завершена':
+                        continue
+                    if not _is_actionable(tid):
+                        continue
+                    seen.add(tid)
+                    planned_ids.append(tid)
+
+                prior_fact_ids = set(fact_sprint_done)
+                planned_ids = [tid for tid in planned_ids if tid not in prior_fact_ids]
+
+                saved_fact = st.session_state.get('_stored_fact', {}) or {}
+
+                if planned_ids:
+                    rows = []
+                    for tid in planned_ids:
+                        # Логика галочки:
+                        # - если пользователь ещё ничего не сохранял (saved_fact пусто) — по умолчанию СТОИТ;
+                        # - если пользователь уже отмечал факт (saved_fact не пусто) — стоит только у тех,
+                        #   у кого в сохранённом факте указан именно этот спринт. То есть снятые галочки
+                        #   остаются снятыми при перезагрузке.
+                        if not saved_fact:
+                            checked = True
+                        else:
+                            checked = saved_fact.get(tid) == sprint
+                        rows.append({
+                            'Задача': tid,
+                            'Команда': task_by_id[tid]['team_id'],
+                            'SP': int(task_by_id[tid]['estimation_sp']),
+                            'Завершено': checked,
+                        })
+                    edit_df = pd.DataFrame(rows)
+                    edited = st.data_editor(
+                        edit_df,
+                        column_config={'Завершено': st.column_config.CheckboxColumn('Реально завершено?')},
+                        disabled=['Задача', 'Команда', 'SP'],
+                        hide_index=True, use_container_width=True,
+                        key=f'fact_editor_{sprint}',
+                    )
+                    selected = edited.loc[edited['Завершено'], 'Задача'].tolist()
+                else:
+                    st.caption('Нет новых завершаемых задач по плану на этот спринт.')
+                    selected = []
+
+                # Информационный блок: задачи, которые по baseline ПРОДОЛЖАЮТСЯ
+                # в этом спринте (были «Растянута (Сплиттинг)»). Их не нужно
+                # подтверждать — они ещё не завершаются, но полезно видеть, что
+                # происходит.
+                continuing_ids, seen_c = [], set()
+                for item in b_schedule.get(sprint, []):
+                    tid = item['task_id']
+                    if tid in seen_c or tid not in task_by_id:
+                        continue
+                    if item.get('status', '') != 'Растянута (Сплиттинг)':
+                        continue
+                    if not _is_actionable(tid):
+                        continue
+                    seen_c.add(tid)
+                    continuing_ids.append((tid, float(item.get('burned_hh', 0) or 0)))
+
+                if continuing_ids:
+                    with st.expander(
+                        f'🔵 Продолжающиеся задачи ({len(continuing_ids)}) — подтверждать не нужно',
+                        expanded=False,
+                    ):
+                        st.caption(
+                            'Эти задачи не завершаются в этом спринте, они идут дальше. '
+                            'Прогресс уже учтён — в следующем спринте они возьмут остаток часов.'
+                        )
+                        cont_df = pd.DataFrame([
+                            {
+                                'Задача': tid,
+                                'Команда': task_by_id[tid]['team_id'],
+                                'SP задачи': int(task_by_id[tid]['estimation_sp']),
+                                'Списано ЧЧ (план)': burned,
+                            }
+                            for tid, burned in continuing_ids
+                        ])
+                        st.dataframe(cont_df, use_container_width=True, hide_index=True)
+                extra_pool = sorted(
+                    (tid for tid in all_task_ids
+                     if tid not in planned_ids and tid not in prior_fact_ids and _is_actionable(tid)),
+                    key=lambda t: (first_appearance.get(t, 999), t),
+                )
+                saved_extra_default = [
+                    tid for tid, s in saved_fact.items()
+                    if s == sprint and tid in extra_pool
+                ]
+                extra_selected = st.multiselect(
+                    'Досрочно завершено (не из этого спринта):',
+                    options=extra_pool,
+                    default=saved_extra_default,
+                    key=f'fact_extra_{sprint}',
+                    help='Задачи, которые по плану должны были делаться в других спринтах, '
+                         'но фактически закрыты уже сейчас.',
+                )
+                for tid in selected + extra_selected:
+                    if tid not in fact_sprint_done:
+                        fact_sprint_done[tid] = sprint
+
+# ---- Сохраняем runtime-состояние на диск ----
+_current_runtime = {
+    'current_time_sprint': current_time_sprint,
+    'fact_sprint_done': fact_sprint_done,
+    'quarter_start_value': quarter_start.isoformat() if quarter_start else None,
+}
+_runtime_hash = hash((
+    _current_runtime['current_time_sprint'],
+    tuple(sorted(_current_runtime['fact_sprint_done'].items())),
+    _current_runtime['quarter_start_value'],
+))
+if st.session_state.get('_last_runtime_hash') != _runtime_hash:
+    storage.save_runtime(_current_runtime)
+    st.session_state['_last_runtime_hash'] = _runtime_hash
+    st.session_state['_stored_current_sprint'] = current_time_sprint
+    st.session_state['_stored_fact'] = dict(fact_sprint_done)
+    st.session_state['_stored_quarter_start_iso'] = _current_runtime['quarter_start_value']
+
+# ===== ВАЛИДАЦИЯ ФАКТИЧЕСКИХ ЗАВИСИМОСТЕЙ =====
+# Предшественник может отсутствовать в fact_sprint_done по трём причинам:
+# 1) он уже Done в исходных данных (закрыт до квартала) — не нарушение;
+# 2) он Canceled/NotTaken — не будет выполняться вообще, блокировать не может;
+# 3) его забыли отметить — реальное нарушение.
+# Раньше мы ругались на все три случая, поэтому у QA-9022 (зависит от
+# ASUKD-5222, который в исходном Excel уже Done) всегда висело предупреждение.
+_done_statuses = {
+    'done', 'completed', 'завершена', 'завершено', 'готово',
+    'выполнена', 'выполнено',
+}
+_skipped_statuses = {
+    'отменено заказ', 'отменена заказчиком', 'отменено заказчиком',
+    'отменено', 'cancelled', 'canceled',
+    'не будет взято в квартал', 'не берем в квартал',
+    'не берём в квартал', 'не будет взято',
+}
+
+
+def _task_status_lower(task_id: str) -> str:
+    rows = sched.tasks.loc[sched.tasks['task_id'] == task_id]
+    if rows.empty:
+        return ''
+    return str(rows.iloc[0].get('status', '')).strip().lower()
+
+
+def _already_done(task_id: str) -> bool:
+    return _task_status_lower(task_id) in _done_statuses
+
+
+def _skipped(task_id: str) -> bool:
+    return _task_status_lower(task_id) in _skipped_statuses
+
+
+fact_dependency_warnings = []
+for task_id, done_sprint in fact_sprint_done.items():
+    if task_id not in sched.G:
+        continue
+    for predecessor in sched.G.predecessors(task_id):
+        if _already_done(predecessor) or _skipped(predecessor):
+            continue  # предшественник не мешает — либо сделан раньше квартала, либо не будет делаться
+
+        predecessor_sprint = fact_sprint_done.get(predecessor)
+        if predecessor_sprint is None:
+            fact_dependency_warnings.append(
+                f'{task_id} отмечена завершённой в Спринте {done_sprint}, '
+                f'но зависимость {predecessor} в факте не завершена.'
+            )
+        elif predecessor_sprint >= done_sprint:
+            fact_dependency_warnings.append(
+                f'{task_id} отмечена в Спринте {done_sprint}, '
+                f'но зависимость {predecessor} завершена в Спринте {predecessor_sprint}.'
+            )
+
+if fact_dependency_warnings:
+    st.warning('⚠️ Обнаружены нарушения фактических зависимостей')
+    with st.expander(f'Показать нарушения ({len(fact_dependency_warnings)})'):
+        for warning in fact_dependency_warnings:
+            st.caption(f'• {warning}')
 
 # ===== ПЕРЕСЧЁТ =====
 needs_recompute = current_time_sprint > 0 or bool(forbidden_donors)
@@ -458,8 +601,9 @@ if dq_warnings:
             st.caption(f'• {warning}')
 
 # ===== ВКЛАДКИ =====
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ['📅 План и Задачи', '👥 Трекер сотрудников', '💡 Лог решений', '⭐ Звездная карта', '⚠️ Алерты']
+tab1, tab2, tab3, tab4, tab5, tab_manage, tab_events = st.tabs(
+    ['📅 План и Задачи', '👥 Трекер сотрудников', '💡 Лог решений', '⭐ Звездная карта', '⚠️ Алерты',
+     '🛠 Управление данными', '📜 Журнал событий']
 )
 
 with tab1:
@@ -508,6 +652,7 @@ with tab1:
 
     if gantt_records:
         gantt_df = pd.DataFrame(gantt_records)
+        fig_height = max(500, min(1400, 30 * gantt_df['Task'].nunique() + 250))
 
         fig = px.timeline(
             gantt_df,
@@ -528,6 +673,8 @@ with tab1:
             ticktext.append(f'Спринт {i}')
 
         fig.update_layout(
+            margin=dict(l=10, r=10, t=60, b=40),
+            uirevision='constant',  # сохраняет позицию/зум при rerender
             height=max(500, min(1400, 30 * gantt_df['Task'].nunique() + 250)),
             xaxis=dict(
                 tickmode='array',
@@ -539,7 +686,7 @@ with tab1:
             legend_title='Команда',
         )
 
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key='gantt_main')
 
         export_df = gantt_df.drop(columns=['Start', 'Finish'])
         st.download_button(
@@ -606,17 +753,21 @@ with tab1:
         st.dataframe(uns_df, use_container_width=True, hide_index=True)
     else:
         st.success('Все задачи успешно распределены в квартал!')
-
 with tab2:
     st.subheader('👥 Загрузка и эффективность сотрудников')
-    st.caption('Утилизация распределяется пропорционально capacity_rate внутри одной связки «команда + роль».')
+    st.caption('Утилизация распределяется пропорционально capacity_rate внутри одной связки «команда + роль». '
+               'Уволенные инженеры исключены из агрегатов.')
 
     emp_data = []
     for _, emp in sched.engineers_df.iterrows():
         engineer_id = emp.get('engineer_id', '')
         team = emp.get('team_id', '')
         role = emp.get('role_norm', '')
+        status = str(emp.get('status', 'Активен'))
+        if status == 'Уволен':
+            continue  # уволенных не показываем в трекере
         cap_rate = float(emp.get('capacity_rate', 0) or 0)
+        # средние часы за спринт по роли (мы уже посчитали team_role_hours как среднее)
         team_role_cap_sprint = float(sched.team_role_hours.get(team, {}).get(role, 0) or 0)
         burned_for_role = float(c_burned.get(team, {}).get(role, 0) or 0)
         emp_sprint_cap = max(0.0, cap_rate * 80.0)
@@ -628,23 +779,34 @@ with tab2:
             emp_burned = 0.0
         util_pct = emp_burned / emp_quarter_cap * 100 if emp_quarter_cap > 0 else 0.0
 
-        emp_data.append(
-            {
-                'Инженер': engineer_id,
-                'Команда': team,
-                'Роль': role,
-                'Ставка': cap_rate,
-                'Доступно (ЧЧ/кв)': round(emp_quarter_cap, 1),
-                'Загрузка (ЧЧ/кв)': round(emp_burned, 1),
-                'Утилизация (%)': f'{min(100, max(0, util_pct)):.1f}%',
-            }
-        )
+        emp_data.append({
+            'Инженер': engineer_id,
+            'Команда': team,
+            'Роль': role,
+            'Статус': status,
+            'Ставка': cap_rate,
+            'Доступно (ЧЧ/кв)': round(emp_quarter_cap, 1),
+            'Загрузка (ЧЧ/кв)': round(emp_burned, 1),
+            'Утилизация (%)': f'{min(100, max(0, util_pct)):.1f}%',
+        })
 
     emp_df = pd.DataFrame(emp_data)
     if not emp_df.empty:
         emp_df['_util_num'] = pd.to_numeric(emp_df['Утилизация (%)'].str.rstrip('%'), errors='coerce').fillna(0)
         emp_df = emp_df.sort_values(by=['_util_num', 'Команда'], ascending=[False, True]).drop(columns='_util_num')
     st.dataframe(emp_df, use_container_width=True, height=600, hide_index=True)
+
+    # Отдельно — уволенные (для аудита)
+    fired = sched.engineers_df[sched.engineers_df['status'] == 'Уволен']
+    if not fired.empty:
+        with st.expander(f'❌ Уволенные ({len(fired)})', expanded=False):
+            st.dataframe(
+                fired[['engineer_id', 'team_id', 'role', 'status_start_date']].rename(columns={
+                    'engineer_id': 'Инженер', 'team_id': 'Команда', 'role': 'Роль',
+                    'status_start_date': 'Дата увольнения',
+                }),
+                use_container_width=True, hide_index=True,
+            )
 
     st.markdown('---')
     st.markdown('##### Историческая стабильность команд')
@@ -871,3 +1033,13 @@ with tab5:
             st.warning(text)
         else:
             st.info(text)
+
+# ===== УПРАВЛЕНИЕ ДАННЫМИ (Auth_redact.md, разделы 7-12) =====
+with tab_manage:
+    if auth.require_permission('edit_data', 'management'):
+        data_management.render(storage)
+
+# ===== ЖУРНАЛ СОБЫТИЙ (Auth_redact.md, раздел 13) =====
+with tab_events:
+    if auth.require_permission('view_audit', 'event_log'):
+        data_management.render_event_log(storage)
