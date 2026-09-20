@@ -50,7 +50,8 @@ class SmartScheduler:
     SPRINTS = range(1, 7)
 
     def __init__(self, data_path: str = None, *, tasks_df=None, estimates_df=None,
-                 deps_df=None, engineers_df=None, history_df=None, sprint_dates=None):
+                 deps_df=None, engineers_df=None, history_df=None,
+                 team_overrides_df=None, sprint_dates=None):
         """
         sprint_dates: dict[int, tuple[date, date]] — опционально. Если передан,
         больничные/отпуска учитываются поспринтово (инженер выпадает только
@@ -67,6 +68,11 @@ class SmartScheduler:
             self.deps_df = deps_df.copy()
             self.engineers_df = engineers_df.copy()
             self.history_df = history_df.copy()
+            # Опциональный DataFrame: ручные переопределения SP capacity
+            # по командам. Если не передан — используем только историю.
+            self.team_overrides_df = (
+                team_overrides_df.copy() if team_overrides_df is not None else pd.DataFrame()
+            )
         elif any(df is not None for df in provided):
             raise ValueError(
                 'Для инициализации из готовых DataFrame нужны все пять: '
@@ -82,6 +88,7 @@ class SmartScheduler:
             self.deps_df = self.parser.get_dependencies()
             self.engineers_df = self.parser.get_engineers()
             self.history_df = self.parser.get_team_history()
+            self.team_overrides_df = pd.DataFrame()
         self._prepare_data()
 
     def _warn(self, message: str):
@@ -211,6 +218,30 @@ class SmartScheduler:
         ].copy()
         avg_vel = valid_hist.groupby('team_id')['velocity_achieved'].mean()
         self.team_sp_capacity = {team: max(0, int(math.floor(v * 0.8))) for team, v in avg_vel.items()}
+
+        # Ручной override SP capacity (data_management → Команды).
+        # Если для команды задано явное число SP/спринт — используем его
+        # вместо расчёта из истории. Нужно, когда состав команды сильно
+        # изменился и историческая velocity уже не отражает реальность.
+        self.team_sp_capacity_source = {team: 'history' for team in self.team_sp_capacity}
+        if self.team_overrides_df is not None and not self.team_overrides_df.empty:
+            if 'team_id' not in self.team_overrides_df.columns or \
+                    'sp_capacity_per_sprint' not in self.team_overrides_df.columns:
+                self._warn(
+                    'team_overrides_df не содержит ожидаемых колонок '
+                    '(team_id, sp_capacity_per_sprint) — overrides проигнорированы.'
+                )
+            else:
+                for _, row in self.team_overrides_df.iterrows():
+                    team = _clean_id(row.get('team_id'))
+                    if not team:
+                        continue
+                    raw = row.get('sp_capacity_per_sprint')
+                    override_val = pd.to_numeric(raw, errors='coerce')
+                    if pd.isna(override_val) or override_val < 0:
+                        continue
+                    self.team_sp_capacity[team] = int(math.floor(override_val))
+                    self.team_sp_capacity_source[team] = 'override'
 
         # 4. ИНЖЕНЕРЫ
         self.engineers_df = self.engineers_df.copy()
@@ -514,6 +545,7 @@ class SmartScheduler:
         sprint_schedule = {s: [] for s in self.SPRINTS}
         explain_logs = []
         alerts = []
+        fact_overrun = defaultdict(dict)  # перерасход факта по командам и ролям
         sprint_when_done = {}
         reserved_sp = set()
         total_burned_hours = defaultdict(dict)
@@ -569,9 +601,9 @@ class SmartScheduler:
                     team = row['team_id']
                     fact_sp = float(row['estimation_sp'])
                     if t_id not in reserved_sp:
-                        if sp_pool.get(team, 0) < fact_sp:
-                            alerts.append({'type': '🔴 ОШИБКА ФАКТА', 'task_id': t_id, 'initiative': row['Номер инициативы'],
-                                           'description': f"Факт по {t_id}: {fact_sp:g} SP при доступном остатке {sp_pool.get(team, 0):g} SP."})
+                        # SP всё равно списываем, но НЕ алертим: факт подтверждён,
+                        # commitment уже потрачен. Превышение по SP фиксируется
+                        # отдельной сводкой ниже, если понадобится.
                         sp_pool[team] = max(0.0, sp_pool.get(team, 0.0) - fact_sp)
                         reserved_sp.add(t_id)
                     orig_hours = self.task_estimates.get(t_id, {})
@@ -579,9 +611,13 @@ class SmartScheduler:
                     for role, hrs in orig_hours.items():
                         hrs = float(hrs)
                         available = team_hours_pool.get(team, {}).get(role, 0.0)
-                        if available < hrs:
-                            alerts.append({'type': '🔴 ОШИБКА ФАКТА', 'task_id': t_id, 'initiative': row['Номер инициативы'],
-                                           'description': f"Факт по {t_id}: роли «{role}» нужно {hrs:g} ЧЧ, доступно {max(0, available):g} ЧЧ."})
+                        # Для подтверждённого факта не генерируем алерт на каждую
+                        # роль. Задача уже сделана — возможно, с привлечением
+                        # доноров, сверхурочно или с переработкой. Перерасход
+                        # копим и показываем одной сводкой в конце.
+                        overrun = max(0.0, hrs - available)
+                        if overrun > 1e-9:
+                            fact_overrun[team][role] = fact_overrun[team].get(role, 0.0) + overrun
                         team_hours_pool.setdefault(team, {})[role] = max(0.0, available - hrs)
                         total_burned_hours[team][role] = total_burned_hours[team].get(role, 0.0) + hrs
                         remaining_hours.setdefault(t_id, {})[role] = 0.0
@@ -931,6 +967,25 @@ class SmartScheduler:
                 if amount > 1e-9:
                     alerts.append({'type': '🟠 РЕСУРСНЫЙ ДЕФИЦИТ', 'task_id': f'Спринт {sprint}', 'initiative': 'Все',
                                    'description': f"В спринте {sprint} не хватило {amount:.1f} ЧЧ роли «{role}» даже после попытки перевода."})
+        # 🟠 Перерасход факта по командам и ролям — одной сводкой.
+        # Заменяет прежние «🔴 ОШИБКА ФАКТА» по каждой роли: те создавали
+        # по 4–5 алертов на одну задачу и зашумляли экран.
+        for team, roles in fact_overrun.items():
+            for role, overrun in roles.items():
+                if overrun > 1e-9:
+                    alerts.append({
+                        'type': '🟠 ПЕРЕРАСХОД ФАКТА',
+                        'task_id': f'{team} / {role}',
+                        'initiative': 'Сводка по кварталу',
+                        'description': (
+                            f"В команде {team} по роли «{role}» фактически "
+                            f"отработано на {overrun:.0f} ЧЧ больше, чем было "
+                            f"доступно в спринтах. Возможные причины: "
+                            f"привлекались доноры из других команд, была "
+                            f"сверхурочная работа, или смета задачи превышает "
+                            f"фонд команды."
+                        ),
+                    })
         # 🟣 ВНИМАНИЕ (Парттайм)
         part_timers = self.engineers_df[
             (self.engineers_df['capacity_rate'] < 1.0)

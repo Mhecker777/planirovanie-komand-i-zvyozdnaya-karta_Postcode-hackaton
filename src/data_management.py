@@ -268,14 +268,117 @@ def render_teams() -> None:
     dfs = _dfs()
     eng_df = dfs['engineers_df']
     tasks_df = dfs['tasks_df']
+    hist_df = dfs.get('history_df')
 
+    # ------- Справочная сводка по командам -------
     summary = eng_df.groupby('team_id').agg(
         Инженеров=('engineer_id', 'count'),
         Ролей=('role', 'nunique'),
     ).reset_index().rename(columns={'team_id': 'Команда'})
     task_counts = tasks_df.groupby('team_id')['task_id'].count().rename('Открытых задач')
     summary = summary.merge(task_counts, left_on='Команда', right_index=True, how='left').fillna({'Открытых задач': 0})
+
+    # Добавим расчётную capacity из истории для справки
+    if hist_df is not None and not hist_df.empty and 'velocity_achieved' in hist_df.columns:
+        vh = hist_df.copy()
+        vh['velocity_achieved'] = pd.to_numeric(vh['velocity_achieved'], errors='coerce')
+        avg_vel = vh.groupby('team_id')['velocity_achieved'].mean()
+        summary['SP/спринт (из истории)'] = summary['Команда'].map(
+            lambda t: int(avg_vel.get(t, 0) * 0.8) if pd.notnull(avg_vel.get(t)) else 'н/д'
+        )
+    else:
+        summary['SP/спринт (из истории)'] = 'н/д'
+
     st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    # ------- Ручной override SP capacity -------
+    st.markdown('---')
+    st.markdown('##### 🎚️ Ручной SP capacity (опционально)')
+    st.caption(
+        'Если состав команды сильно изменился и историческая velocity уже не '
+        'отражает реальность — задайте SP на спринт вручную. Значение '
+        'используется вместо расчёта из Team_history. Пустое поле — команда '
+        'использует значение из истории.'
+    )
+
+    overrides_df = dfs.get('team_overrides_df')
+    if overrides_df is None or not isinstance(overrides_df, pd.DataFrame):
+        overrides_df = pd.DataFrame(columns=['team_id', 'sp_capacity_per_sprint', 'comment'])
+        dfs['team_overrides_df'] = overrides_df
+
+    all_teams = sorted(set(eng_df['team_id'].astype(str)) | set(tasks_df['team_id'].astype(str)))
+    all_teams = [t for t in all_teams if t and t.lower() != 'nan']
+
+    # Собираем текущее состояние: одна строка на каждую команду
+    existing = {}
+    if not overrides_df.empty:
+        for _, row in overrides_df.iterrows():
+            tid = str(row.get('team_id', '')).strip()
+            if tid:
+                existing[tid] = {
+                    'sp_capacity_per_sprint': row.get('sp_capacity_per_sprint'),
+                    'comment': row.get('comment', ''),
+                }
+
+    ui_rows = []
+    for team in all_teams:
+        ov = existing.get(team, {})
+        ui_rows.append({
+            'Команда': team,
+            'SP на спринт (override)': ov.get('sp_capacity_per_sprint', None),
+            'Комментарий': ov.get('comment', '') or '',
+        })
+    ui_df = pd.DataFrame(ui_rows)
+
+    edited_ov = st.data_editor(
+        ui_df,
+        hide_index=True,
+        use_container_width=True,
+        key='team_overrides_editor',
+        column_config={
+            'Команда': st.column_config.TextColumn('Команда', disabled=True),
+            'SP на спринт (override)': st.column_config.NumberColumn(
+                'SP на спринт (override)',
+                min_value=0, max_value=200, step=1,
+                help='Оставьте пустым, чтобы использовать значение из Team_history.',
+            ),
+            'Комментарий': st.column_config.TextColumn(
+                'Комментарий', help='Например: «наняли двух senior-разработчиков в октябре»',
+            ),
+        },
+    )
+
+    if st.button('✅ Применить SP capacity'):
+        new_rows = []
+        for _, r in edited_ov.iterrows():
+            team = str(r['Команда']).strip()
+            if not team:
+                continue
+            raw_cap = r.get('SP на спринт (override)')
+            cap_val = pd.to_numeric(raw_cap, errors='coerce')
+            if pd.isna(cap_val):
+                # Пустое поле — override снимается, команда вернётся к истории
+                continue
+            new_rows.append({
+                'team_id': team,
+                'sp_capacity_per_sprint': int(cap_val),
+                'comment': str(r.get('Комментарий', '') or ''),
+            })
+
+        old_overrides = overrides_df.copy() if overrides_df is not None else pd.DataFrame()
+        dfs['team_overrides_df'] = (
+            pd.DataFrame(new_rows) if new_rows
+            else pd.DataFrame(columns=['team_id', 'sp_capacity_per_sprint', 'comment'])
+        )
+
+        _stage(
+            'update', 'team_overrides',
+            comment=f'Обновлены SP capacity overrides: {len(new_rows)} команд',
+            old_value=old_overrides.to_dict('records') if not old_overrides.empty else None,
+            new_value=new_rows,
+        )
+        st.success(f'Применено. Команд с ручным override: {len(new_rows)}.')
+        st.rerun()
 
     st.markdown('---')
     st.markdown('##### ➕ Создать команду')

@@ -117,6 +117,9 @@ if 'working_dfs' not in st.session_state:
             'tasks_df': parser.get_tasks(), 'estimates_df': parser.get_estimates(),
             'deps_df': parser.get_dependencies(), 'engineers_df': parser.get_engineers(),
             'history_df': parser.get_team_history(),
+            'team_overrides_df': pd.DataFrame(
+                columns=['team_id', 'sp_capacity_per_sprint', 'comment']
+            ),
         }
         version = storage.save_snapshot(dfs, user=auth.DEFAULT_USER, comment='Первичная загрузка из dataset.xlsx')
     st.session_state['working_dfs'] = dfs
@@ -729,7 +732,7 @@ with tab1:
         st.info('В текущем сценарии ни одна задача не получила плановые часы.')
 
     st.markdown('---')
-    st.subheader('❌ Задачи, не поместившиеся в квартал')
+    st.subheader('📋 Статус незавершённых задач')
 
     reason_labels = {
         'dependency': '🟡 Ждёт зависимость',
@@ -745,13 +748,25 @@ with tab1:
         'transfer': '🔄 Перевод ресурса',
     }
 
-    unscheduled = []
+    # Какие задачи реально попали хотя бы в один спринт текущего плана.
+    # Разделяем незавершённые задачи на две категории:
+    #  - «Продолжаются»  → задача есть в c_schedule (идёт сплиттинг по спринтам);
+    #  - «Не поместились» → задача ни разу не появилась в c_schedule
+    #    (заблокирована, дефицит ролей, нет SP — словом, вообще не стартовала).
+    # Раньше обе категории падали в одну таблицу, из-за чего MP-102 выглядела
+    # как «растянута И блокируется» одновременно.
+    tasks_in_plan = set()
+    for _items in c_schedule.values():
+        for _item in _items:
+            tasks_in_plan.add(_item['task_id'])
+
+    continuing_rows = []
+    not_fit_rows = []
+
     for _, row in sched.tasks.iterrows():
         tid = row['task_id']
         status = c_statuses.get(tid)
-        if status == 'Done':
-            continue
-        if status in {'Canceled', 'NotTaken'}:
+        if status in {'Done', 'Canceled', 'NotTaken'}:
             continue
 
         task_logs = c_logs[c_logs['task_id'] == tid] if not c_logs.empty else pd.DataFrame()
@@ -761,28 +776,57 @@ with tab1:
             reason_code = str(last.get('reason_code', ''))
             category = reason_labels.get(reason_code, '⚪ Другое')
             reason_text = str(last.get('reason', ''))
-            if status == 'InProgress' and reason_code != 'split':
-                category = reason_labels['split']
-                reason_text = f"Задача продолжается в следующем спринте. {reason_text}"
         else:
             category = '⚪ Другое'
             reason_text = 'Критический дефицит ресурсов или некорректные исходные данные.'
-        unscheduled.append(
-            {
-                'Задача': tid,
-                'Rung': row.get('rung', 0),
-                'Инициатива': row.get('Номер инициативы', 'Без инициативы'),
-                'Команда': row.get('team_id', ''),
-                'Категория': category,
-                'Причина невыполнения': reason_text,
-            }
+
+        record = {
+            'Задача': tid,
+            'Rung': row.get('rung', 0),
+            'Инициатива': row.get('Номер инициативы', 'Без инициативы'),
+            'Команда': row.get('team_id', ''),
+            'Категория': category,
+            'Причина': reason_text,
+        }
+
+        if tid in tasks_in_plan:
+            continuing_rows.append(record)
+        else:
+            not_fit_rows.append(record)
+
+    # ---------- Блок 1: задачи, которые идут в сплиттинге ----------
+    if continuing_rows:
+        with st.expander(
+            f'🔵 Продолжаются в следующих спринтах ({len(continuing_rows)})',
+            expanded=False,
+        ):
+            st.caption(
+                'Эти задачи есть в плане хотя бы одного спринта. Они ещё '
+                'не завершены: часть часов уже списана, остаток перенесён '
+                'в следующие спринты.'
+            )
+            st.dataframe(
+                pd.DataFrame(continuing_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    # ---------- Блок 2: задачи, которые вообще не стартовали ----------
+    if not_fit_rows:
+        st.markdown(f'##### ❌ Не поместились в квартал ({len(not_fit_rows)})')
+        st.caption(
+            'Эти задачи не попали ни в один спринт. Причина — в колонке '
+            '«Причина»: блокирующая зависимость, дефицит SP, дефицит ролей '
+            'или некорректные исходные данные.'
+        )
+        st.dataframe(
+            pd.DataFrame(not_fit_rows),
+            use_container_width=True,
+            hide_index=True,
         )
 
-    if unscheduled:
-        uns_df = pd.DataFrame(unscheduled)
-        st.dataframe(uns_df, use_container_width=True, hide_index=True)
-    else:
-        st.success('Все задачи успешно распределены в квартал!')
+    if not continuing_rows and not not_fit_rows:
+        st.success('Все задачи успешно распределены и завершены в квартале!')
 with tab2:
     st.subheader('👥 Загрузка и эффективность сотрудников')
     st.caption('Утилизация распределяется пропорционально capacity_rate внутри одной связки «команда + роль». '
@@ -1041,29 +1085,46 @@ with tab4:
                 st.dataframe(single_role, use_container_width=True, hide_index=True)
 
 with tab5:
-    reds = [a for a in c_alerts if '🔴' in a.get('type', '')]
-    yellows = [a for a in c_alerts if '🟡' in a.get('type', '')]
-    oranges = [a for a in c_alerts if '🟠' in a.get('type', '')]
-    purples = [a for a in c_alerts if '🟣' in a.get('type', '')]
-    browns = [a for a in c_alerts if '🟤' in a.get('type', '')]
+    # Разбиваем алерты по категориям и рендерим каждую в своём expander.
+    # Иначе Парттайм и другие «некрасные» алерты тонут среди десятков
+    # красных блоков и их невозможно найти.
+    alert_categories = [
+        ('🔴 СРЫВ И ОШИБКИ ПЛАНИРОВАНИЯ', '🔴', st.error, True),
+        ('🟤 СТРУКТУРНЫЙ ДЕФИЦИТ', '🟤', st.error, True),
+        ('🟠 РЕСУРСНЫЙ ДЕФИЦИТ / ПЕРЕРАСХОД', '🟠', st.warning, True),
+        ('🟡 РИСК КАСКАДНОГО СДВИГА', '🟡', st.warning, False),
+        ('🟣 ПАРТТАЙМ', '🟣', st.info, True),
+    ]
 
-    # 5 колонок вместо 3
+    # Считаем количество в каждой категории
+    counters = {}
+    for label, emoji, _, _ in alert_categories:
+        counters[label] = sum(1 for a in c_alerts if emoji in a.get('type', ''))
+
+    # Шапка с числами
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.error(f'🔴 Срывы: {len(reds)}')
-    c2.warning(f'🟡 Сдвиги: {len(yellows)}')
-    c3.info(f'🟠 Дефициты в спринте: {len(oranges)}')
-    c4.success(f'🟣 Парттайм: {len(purples)}')
-    c5.error(f'🟤 Стр. дефицит: {len(browns)}')
+    c1.error(f'🔴 Срывы: {counters["🔴 СРЫВ И ОШИБКИ ПЛАНИРОВАНИЯ"]}')
+    c2.warning(f'🟡 Сдвиги: {counters["🟡 РИСК КАСКАДНОГО СДВИГА"]}')
+    c3.info(f'🟠 Дефициты: {counters["🟠 РЕСУРСНЫЙ ДЕФИЦИТ / ПЕРЕРАСХОД"]}')
+    c4.success(f'🟣 Парттайм: {counters["🟣 ПАРТТАЙМ"]}')
+    c5.error(f'🟤 Стр. дефицит: {counters["🟤 СТРУКТУРНЫЙ ДЕФИЦИТ"]}')
 
-    for alert in c_alerts:
-        text = f"**{alert.get('type', 'Алерт')}** | {alert.get('task_id', '')} ({alert.get('initiative', '')})\n\n{alert.get('description', '')}"
-        if '🔴' in alert.get('type', '') or '🟤' in alert.get('type', ''):
-            st.error(text)
-        elif '🟡' in alert.get('type', ''):
-            st.warning(text)
-        else:
-            st.info(text)
+    st.divider()
 
+    # Рендер каждой категории в своём expander
+    for label, emoji, renderer, expanded in alert_categories:
+        group = [a for a in c_alerts if emoji in a.get('type', '')]
+        if not group:
+            continue
+        with st.expander(f'{label} ({len(group)})', expanded=expanded):
+            for alert in group:
+                text = (
+                    f"**{alert.get('type', 'Алерт')}** | "
+                    f"{alert.get('task_id', '')} "
+                    f"({alert.get('initiative', '')})\n\n"
+                    f"{alert.get('description', '')}"
+                )
+                renderer(text)
 # ===== УПРАВЛЕНИЕ ДАННЫМИ (Auth_redact.md, разделы 7-12) =====
 with tab_manage:
     if auth.require_permission('edit_data', 'management'):
