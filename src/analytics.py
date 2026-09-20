@@ -15,9 +15,20 @@ def _normalize_skill(skill: str) -> str:
 
 
 class StarMapAnalytics:
-    def __init__(self, data_path: str):
-        self.parser = DataParser(data_path)
-        self.engineers = self.parser.get_engineers()
+    def __init__(self, data_path: str = None, *, engineers_df=None):
+        """
+        Как и SmartScheduler (см. Auth_redact.md, раздел 14.1): либо data_path
+        (читаем Excel через DataParser), либо готовый engineers_df — нужно,
+        чтобы правки в «Управление данными» сразу отражались в Bus Factor,
+        не дожидаясь пересохранения файла.
+        """
+        if engineers_df is not None:
+            self.engineers = engineers_df.copy()
+        elif data_path is not None:
+            self.parser = DataParser(data_path)
+            self.engineers = self.parser.get_engineers()
+        else:
+            raise ValueError('Нужен либо data_path, либо engineers_df.')
 
         self.engineers['engineer_id'] = self.engineers['engineer_id'].astype(str).str.strip()
         self.engineers['team_id'] = self.engineers['team_id'].astype(str).str.strip()

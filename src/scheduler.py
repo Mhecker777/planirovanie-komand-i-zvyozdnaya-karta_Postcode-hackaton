@@ -50,19 +50,15 @@ class SmartScheduler:
     SPRINTS = range(1, 7)
 
     def __init__(self, data_path: str = None, *, tasks_df=None, estimates_df=None,
-                deps_df=None, engineers_df=None, history_df=None):
+                 deps_df=None, engineers_df=None, history_df=None, sprint_dates=None):
         """
-        Два режима инициализации:
-        1) data_path — читать из Excel через DataParser (как раньше, для
-           первого запуска / сброса к исходнику).
-        2) 5 готовых DataFrame — для интеграции со слоем хранения
-           (Auth_redact.md, раздел 14.1): после правок в CRUD-интерфейсе
-           данные лежат в SQLite, а не в Excel, и должны попадать в
-           SmartScheduler напрямую, без повторного парсинга файла.
-        Второй режим требует ВСЕ пять DataFrame сразу — частичная
-        подстановка не поддерживается, чтобы не создавать рассинхронизацию
-        между, например, новыми задачами и старой сметой.
+        sprint_dates: dict[int, tuple[date, date]] — опционально. Если передан,
+        больничные/отпуска учитываются поспринтово (инженер выпадает только
+        из тех спринтов, которые пересекаются с его периодом отсутствия).
+        Если не передан, любой неактивный статус считается как «весь квартал»
+        (обратная совместимость с прежним поведением).
         """
+        self.sprint_dates = sprint_dates
         provided = [tasks_df, estimates_df, deps_df, engineers_df, history_df]
         if all(df is not None for df in provided):
             self.data_path = data_path
@@ -217,27 +213,88 @@ class SmartScheduler:
             self._warn(f"Инженер {row.get('engineer_id') or '?'}: некорректный capacity_rate; использовано 0.")
         self.engineers_df.loc[bad_cap, 'capacity_rate'] = 0.0
 
-        for _, row in self.engineers_df.loc[self.engineers_df['capacity_rate'] > 1].iterrows():
-            self._warn(f"Инженер {row.get('engineer_id') or '?'}: capacity_rate={row['capacity_rate']:.2f} больше 1; значение сохранено как задано.")
-
-        # СТАТУС ИНЖЕНЕРА (Auth_redact.md, раздел 14.2). В исходном Excel такой
-        # колонки нет — все считаются 'Активен'. Как только слой хранения
-        # (storage.py) появится, статус будет проставляться через CRUD
-        # («Управление инженерами»), и эта же логика подхватит его без
-        # дополнительных изменений в SmartScheduler.
         if 'status' not in self.engineers_df.columns:
             self.engineers_df['status'] = 'Активен'
+        if 'status_start_date' not in self.engineers_df.columns:
+            self.engineers_df['status_start_date'] = ''
+        if 'status_end_date' not in self.engineers_df.columns:
+            self.engineers_df['status_end_date'] = ''
         self.engineers_df['status'] = self.engineers_df['status'].fillna('Активен').replace('', 'Активен')
 
         fired_mask = self.engineers_df['status'] == 'Уволен'
-        temp_inactive_mask = self.engineers_df['status'].isin(['Больничный', 'Отпуск'])
-        # Уволенный — часы не считаем вообще (как будто человека нет в штате).
-        # Больничный/отпуск — человек остаётся в списках (виден в UI), но
-        # его часы на этот период равны нулю, а не исчезают из истории.
-        self.engineers_df.loc[temp_inactive_mask, 'capacity_rate'] = 0.0
-        for _, row in self.engineers_df.loc[temp_inactive_mask].iterrows():
-            self._warn(f"Инженер {row.get('engineer_id') or '?'}: статус «{row['status']}», часы на период отсутствия не учитываются.")
 
+        # Поспринтовый расчёт часов: инженер активен в спринте, если
+        # (а) не уволен и (б) его период отсутствия не пересекается со спринтом.
+        self.team_role_hours_by_sprint = {s: {} for s in self.SPRINTS}
+        self.team_role_engineers_by_sprint = {s: {} for s in self.SPRINTS}
+
+        def _is_active_in_sprint(row, sprint_idx):
+            if row['status'] == 'Уволен':
+                return False
+            if row['status'] in ('Больничный', 'Отпуск'):
+                s_raw = row.get('status_start_date', '')
+                e_raw = row.get('status_end_date', '')
+                if not s_raw or not e_raw or pd.isna(s_raw) or pd.isna(e_raw):
+                    return False  # без дат — весь квартал
+                try:
+                    s_d = pd.to_datetime(s_raw).date()
+                    e_d = pd.to_datetime(e_raw).date()
+                except (ValueError, TypeError):
+                    return False
+                if self.sprint_dates is None:
+                    return False  # обратная совместимость
+                sprint_start, sprint_end = self.sprint_dates[sprint_idx]
+                return not (e_d < sprint_start or s_d > sprint_end)
+            return True
+
+        valid_eng_rows = []
+        for _, row in self.engineers_df.iterrows():
+            if not row['team_id'] or not row['role_norm']:
+                if row['status'] != 'Уволен':
+                    self._warn(f"Инженер {row.get('engineer_id') or '?'}: "
+                               f"отсутствует команда или роль; строка не участвует в фонде часов.")
+                continue
+            cap = float(row['capacity_rate'])
+            if pd.isna(cap) or cap <= 0:
+                continue
+            valid_eng_rows.append(row)
+
+        # Заполняем поспринтовые пулы
+        for row in valid_eng_rows:
+            for sprint_idx in self.SPRINTS:
+                if not _is_active_in_sprint(row, sprint_idx):
+                    continue
+                team = row['team_id']
+                role = row['role_norm']
+                eng_id = row['engineer_id']
+                hrs = float(row['capacity_rate']) * 80.0
+                bucket = self.team_role_hours_by_sprint[sprint_idx].setdefault(team, {})
+                bucket[role] = bucket.get(role, 0.0) + hrs
+                eng_bucket = self.team_role_engineers_by_sprint[sprint_idx].setdefault(team, {}).setdefault(role, set())
+                eng_bucket.add(eng_id)
+
+        # team_role_hours / team_role_engineers — среднее за квартал (для обратной совместимости с UI).
+        self.team_role_hours = {}
+        self.team_role_engineers = {}
+        for sprint_idx in self.SPRINTS:
+            for team, roles in self.team_role_hours_by_sprint[sprint_idx].items():
+                for role, hrs in roles.items():
+                    self.team_role_hours.setdefault(team, {})[role] = (
+                            self.team_role_hours.setdefault(team, {}).get(role, 0.0) + hrs / len(self.SPRINTS)
+                    )
+            for team, roles in self.team_role_engineers_by_sprint[sprint_idx].items():
+                for role, engineers in roles.items():
+                    self.team_role_engineers.setdefault(team, {}).setdefault(role, set()).update(engineers)
+
+        self.known_roles = set()
+        for roles in self.team_role_hours.values():
+            self.known_roles.update(roles.keys())
+
+        # Единый аудит по отсутствующим — по одному предупреждению на человека.
+        for _, row in self.engineers_df.iterrows():
+            if row['status'] in ('Больничный', 'Отпуск'):
+                self._warn(f"Инженер {row.get('engineer_id')}: статус «{row['status']}», "
+                           f"часы на период отсутствия не учитываются.")
         bad_eng = (self.engineers_df['team_id'] == '') | (self.engineers_df['role_norm'] == '') | fired_mask
         for _, row in self.engineers_df.loc[bad_eng & ~fired_mask].iterrows():
             self._warn(f"Инженер {row.get('engineer_id') or '?'}: отсутствует команда или роль; строка не участвует в фонде часов.")
@@ -478,7 +535,7 @@ class SmartScheduler:
 
         for sprint in self.SPRINTS:
             sp_pool = {k: max(0, float(v)) for k, v in self.team_sp_capacity.items()}
-            team_hours_pool = {t: dict(roles) for t, roles in self.team_role_hours.items()}
+            team_hours_pool = {t: dict(roles) for t, roles in self.team_role_hours_by_sprint[sprint].items()}
 
             # ФАКТ прошлых спринтов: принимаем как истину, но фиксируем перерасход.
             if sprint <= current_time_sprint:
@@ -514,6 +571,11 @@ class SmartScheduler:
                                                     'burned_hh': burned, 'summary': row.get('summary', ''), 'rung': row.get('rung', 0)})
 
                 # 2. Задачи из baseline на этот спринт, которые НЕ закрыты в факте.
+                #    ВАЖНО: сплитованные задачи («Растянута (Сплиттинг)») в этот
+                #    блок НЕ попадают как «Не выполнена (Факт)» — они не должны
+                #    завершаться в этом спринте. Их прогресс (baseline burned_hh)
+                #    списывается из remaining_hours, а сама задача остаётся
+                #    в работе и попадёт в следующий спринт.
                 if baseline_schedule is not None:
                     fact_done_ids = {t for t, s in fact_sprint_done.items() if s == sprint}
                     seen_in_schedule = set()
@@ -527,17 +589,66 @@ class SmartScheduler:
                             continue
                         row = task_rows[tid]
                         seen_in_schedule.add(tid)
-                        sprint_schedule[sprint].append({
-                            'task_id': tid,
-                            'initiative': row['Номер инициативы'],
-                            'team': row['team_id'],
-                            'sp': 0.0,
-                            'task_sp': float(row['estimation_sp']),
-                            'status': 'Не выполнена (Факт)',
-                            'burned_hh': 0.0,
-                            'summary': row.get('summary', ''),
-                            'rung': row.get('rung', 0),
-                        })
+                        baseline_status = item.get('status', '')
+
+                        # SP были закоммичены ещё в baseline — резервируем,
+                        # чтобы при пересчёте не списать их снова.
+                        if tid not in reserved_sp:
+                            sp_needed_b = float(row['estimation_sp'])
+                            team_b = row['team_id']
+                            sp_pool[team_b] = max(0.0, sp_pool.get(team_b, 0.0) - sp_needed_b)
+                            reserved_sp.add(tid)
+
+                        if baseline_status == 'Завершена':
+                            # Планировалась к завершению, но факт не подтверждён — провал.
+                            sprint_schedule[sprint].append({
+                                'task_id': tid,
+                                'initiative': row['Номер инициативы'],
+                                'team': row['team_id'],
+                                'sp': 0.0,
+                                'task_sp': float(row['estimation_sp']),
+                                'status': 'Не выполнена (Факт)',
+                                'burned_hh': 0.0,
+                                'summary': row.get('summary', ''),
+                                'rung': row.get('rung', 0),
+                            })
+                            # Задача была начата — приоритет как у InProgress,
+                            # чтобы пересчёт не отодвигал её в конец очереди.
+                            if task_status.get(tid) != 'Done':
+                                task_status[tid] = 'InProgress'
+
+                        elif baseline_status == 'Растянута (Сплиттинг)':
+                            # Продолжается. Списываем плановый прогресс из
+                            # remaining_hours, чтобы в следующем спринте
+                            # задача не начиналась с полной сметы.
+                            baseline_burned = float(item.get('burned_hh', 0) or 0)
+                            sprint_schedule[sprint].append({
+                                'task_id': tid,
+                                'initiative': row['Номер инициативы'],
+                                'team': row['team_id'],
+                                'sp': 0.0,
+                                'task_sp': float(row['estimation_sp']),
+                                'status': 'Продолжается (Факт)',
+                                'burned_hh': baseline_burned,
+                                'summary': row.get('summary', ''),
+                                'rung': row.get('rung', 0),
+                            })
+                            orig_hours = self.task_estimates.get(tid, {})
+                            total_orig = sum(float(h) for h in orig_hours.values())
+                            if total_orig > 0 and baseline_burned > 0:
+                                ratio = min(1.0, baseline_burned / total_orig)
+                                for role, hrs in orig_hours.items():
+                                    consumed = float(hrs) * ratio
+                                    remaining_hours.setdefault(tid, {})[role] = max(
+                                        0.0,
+                                        remaining_hours.get(tid, {}).get(role, float(hrs)) - consumed,
+                                    )
+                            # КРИТИЧНО: задача продолжается → она должна сохранить
+                            # приоритет InProgress. Без этой строки в пересчёте
+                            # она становится Planned, теряет очередь и график
+                            # «съезжает» — именно то, что вы наблюдали при
+                            # выборе «Спринт 1 завершён».
+                            task_status[tid] = 'InProgress'
                 continue
 
             # ============================================================
@@ -794,14 +905,18 @@ class SmartScheduler:
                     alerts.append({'type': '🟠 РЕСУРСНЫЙ ДЕФИЦИТ', 'task_id': f'Спринт {sprint}', 'initiative': 'Все',
                                    'description': f"В спринте {sprint} не хватило {amount:.1f} ЧЧ роли «{role}» даже после попытки перевода."})
         # 🟣 ВНИМАНИЕ (Парттайм)
-        part_timers = self.engineers_df[self.engineers_df['capacity_rate'] < 1.0]['engineer_id'].unique()
+        part_timers = self.engineers_df[
+            (self.engineers_df['capacity_rate'] < 1.0)
+            & (self.engineers_df['capacity_rate'] > 0)
+            & (self.engineers_df['status'] == 'Активен')
+        ]['engineer_id'].unique()
         if len(part_timers) > 0:
             alerts.append({
                 'type': '🟣 ВНИМАНИЕ (Парттайм)', 'task_id': 'Штатное расписание', 'initiative': 'Орг. структура',
                 'description': f"Инженеры разделены между командами (менее 1.0 ставки): {', '.join(part_timers)}. Суммарное время жестко ограничено."
             })
 
-        # 🟤 СТРУКТУРНЫЙ ДЕФИЦИТ (роль отсутствует в команде)
+        # 🟤 СТРУКТУРНЫЙ ДЕФИЦИТ (роль отсутствует в команде) с учётом увольнений
         for row in scored_tasks:
             t_id = row['task_id']
             team = row['team_id']
@@ -809,10 +924,31 @@ class SmartScheduler:
                 continue
             req_hours = self.task_estimates.get(t_id, {})
             for r, needed in req_hours.items():
-                if needed > 0 and r not in self.team_role_hours.get(team, {}):
+                if needed <= 0:
+                    continue
+                # Есть ли в компании хоть кто-то с этой ролью в этой команде?
+                team_has_role_total = r in self.team_role_hours.get(team, {})
+                if not team_has_role_total:
+                    # Никогда не было
                     alerts.append({
-                        'type': '🟤 СТРУКТУРНЫЙ ДЕФИЦИТ', 'task_id': t_id, 'initiative': row.get('Номер инициативы', 'Без инициативы'),
-                        'description': f"Роль «{r}» полностью отсутствует в штате команды {team}. Выполнение задачи зависит исключительно от переводов из других команд."
+                        'type': '🟤 СТРУКТУРНЫЙ ДЕФИЦИТ',
+                        'task_id': t_id, 'initiative': row.get('Номер инициативы', 'Без инициативы'),
+                        'description': f"Роль «{r}» полностью отсутствует в штате команды {team}. "
+                                       f"Выполнение задачи зависит исключительно от переводов из других команд."
+                    })
+                    continue
+                # Есть вообще, но в спринтах текущего квартала часов нет — вероятно, все носители уволены/на больничном
+                has_any_hours = any(
+                    self.team_role_hours_by_sprint[s].get(team, {}).get(r, 0) > 0
+                    for s in self.SPRINTS
+                )
+                if not has_any_hours:
+                    alerts.append({
+                        'type': '🟤 НЕТ ДОСТУПНОГО СПЕЦИАЛИСТА',
+                        'task_id': t_id, 'initiative': row.get('Номер инициативы', 'Без инициативы'),
+                        'description': f"В команде {team} нет активного специалиста роли «{r}» ни в одном "
+                                       f"спринте квартала (увольнение/отпуск/больничный). "
+                                       f"Задача не может быть выполнена без найма или перевода."
                     })
 
         # 🟤 СТРУКТУРНЫЙ ДЕФИЦИТ (роль отсутствует в компании) — проверяем raw-смету,
