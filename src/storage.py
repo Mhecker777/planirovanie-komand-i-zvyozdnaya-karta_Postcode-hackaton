@@ -32,7 +32,11 @@ ACCESS_LOG_DEDUP_WINDOW = timedelta(minutes=5)
 
 AUTO_BACKUP_EVERY = 10  # раздел 17, вопрос 8 — согласовано явно
 
-DF_KEYS = ['tasks_df', 'estimates_df', 'deps_df', 'engineers_df', 'history_df']
+DF_KEYS = ['tasks_df', 'estimates_df', 'deps_df', 'engineers_df', 'history_df', 'team_overrides_df']
+
+# Ключи, которые могут отсутствовать в старых снапшотах — при загрузке
+# подставляем пустые DataFrame, чтобы код не падал.
+OPTIONAL_DF_KEYS = {'team_overrides_df'}
 
 
 def _stringify(value) -> Optional[str]:
@@ -141,8 +145,18 @@ class StateStorage:
     @staticmethod
     def _payload_to_dataframes(payload_json: str) -> dict:
         payload = json.loads(payload_json)
-        data = payload.get('data', payload)  # запас на случай будущей смены формата
-        return {k: pd.read_json(io.StringIO(v), orient='split') for k, v in data.items()}
+        data = payload.get('data', payload)
+        result = {k: pd.read_json(io.StringIO(v), orient='split') for k, v in data.items()}
+        # Обратная совместимость: снапшоты до появления override SP capacity
+        # не содержат team_overrides_df. Подставляем пустую таблицу с нужной
+        # схемой, чтобы код дальше работал без if-ов.
+        for key in OPTIONAL_DF_KEYS:
+            if key not in result:
+                if key == 'team_overrides_df':
+                    result[key] = pd.DataFrame(
+                        columns=['team_id', 'sp_capacity_per_sprint', 'comment']
+                    )
+        return result
 
     def load_latest(self):
         """Возвращает (dataframes, version) последнего снапшота или None, если снапшотов ещё нет."""
