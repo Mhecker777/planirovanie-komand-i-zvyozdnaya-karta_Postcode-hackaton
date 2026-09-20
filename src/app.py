@@ -189,7 +189,8 @@ forbidden_donors = set()
 if not transfer_summary.empty:
     st.sidebar.caption(
         'Алгоритм показывает автоматические переводы из baseline. '
-        'Вы можете запретить конкретную связку «донор + роль» и пересчитать план.'
+        'Вы можете запретить конкретную связку «донор + роль» и пересчитать план. '
+        'Актуальный список переводов — ниже, после пересчёта.'
     )
     ts = transfer_summary.copy()
     ts['_key'] = ts['Команда-донор'].astype(str) + ' отдаёт «' + ts['Роль'].astype(str) + '»'
@@ -198,8 +199,6 @@ if not transfer_summary.empty:
     for value in picked:
         donor, role_part = value.split(' отдаёт «', 1)
         forbidden_donors.add((donor, role_part.rstrip('»')))
-    with st.sidebar.expander(f'Все автопереводы в baseline ({len(transfer_summary)})'):
-        st.dataframe(transfer_summary, use_container_width=True, hide_index=True)
 else:
     st.sidebar.caption('В baseline-плане переводов между командами не потребовалось.')
 
@@ -473,7 +472,27 @@ else:
     c_schedule, c_statuses, c_logs, c_alerts, c_kpis, c_burned = (
         b_schedule, b_statuses, b_logs, b_alerts, b_kpis, b_burned
     )
-
+# ---- Актуальный список переводов после пересчёта ----
+# Показываем в сайдбаре то, что реально осталось в плане с учётом запретов.
+# Раньше здесь отображался baseline — из-за этого запрещённые переводы
+# визуально никуда не исчезали.
+current_transfer_summary = sched.get_transfer_summary(c_logs)
+with st.sidebar.expander(
+    f'📋 Переводы в текущем плане ({len(current_transfer_summary)})',
+    expanded=False,
+):
+    if current_transfer_summary.empty:
+        st.caption('В текущем плане переводов между командами нет.')
+    else:
+        st.dataframe(current_transfer_summary, use_container_width=True, hide_index=True)
+        csv_transfers = current_transfer_summary.to_csv(index=False, sep=';').encode('utf-8-sig')
+        st.download_button(
+            '📥 Скачать список переводов (CSV)',
+            data=csv_transfers,
+            file_name='pochtatech_transfers.csv',
+            mime='text/csv',
+            key='download_transfers_csv',
+        )
 # ===== KPI =====
 col1, col2, col3, col4 = st.columns(4)
 col1.metric('PI Predictability Measure', c_kpis['PI Predictability Measure'])
