@@ -139,6 +139,17 @@ class SmartScheduler:
 
         self.tasks['status'] = self.tasks['status'].map(lambda x: '' if x is None or pd.isna(x) else str(x).strip())
         self.tasks['rung'] = pd.to_numeric(self.tasks['rung'], errors='coerce').fillna(0)
+        # Минимальный спринт, с которого задача может стартовать.
+        # В исходном Excel такого поля нет — все задачи по умолчанию с 1-го спринта.
+        # Поле задаётся через UI «Управление данными» при создании новой задачи:
+        # если пользователь завершил 3-й спринт и добавляет задачу — start_sprint
+        # по умолчанию ставится в 4, и планировщик не подсунет её в уже прошедшие.
+        if 'start_sprint' not in self.tasks.columns:
+            self.tasks['start_sprint'] = 1
+        self.tasks['start_sprint'] = (
+            pd.to_numeric(self.tasks['start_sprint'], errors='coerce')
+            .fillna(1).astype(int).clip(1, 6)
+        )
 
         sp_raw = pd.to_numeric(self.tasks['estimation_sp'], errors='coerce')
         bad_sp = sp_raw.isna() | (sp_raw <= 0)
@@ -229,22 +240,33 @@ class SmartScheduler:
         self.team_role_engineers_by_sprint = {s: {} for s in self.SPRINTS}
 
         def _is_active_in_sprint(row, sprint_idx):
+            """True, если инженер доступен в указанном спринте.
+
+            - Уволен → всегда False.
+            - Больничный/Отпуск:
+                * без дат → отсутствует весь квартал → False;
+                * период отсутствия пересекается со спринтом → False;
+                * период целиком до или после спринта → True.
+            - Активен → True.
+            """
             if row['status'] == 'Уволен':
                 return False
+
             if row['status'] in ('Больничный', 'Отпуск'):
                 s_raw = row.get('status_start_date', '')
                 e_raw = row.get('status_end_date', '')
                 if not s_raw or not e_raw or pd.isna(s_raw) or pd.isna(e_raw):
-                    return False  # без дат — весь квартал
+                    return False
                 try:
                     s_d = pd.to_datetime(s_raw).date()
                     e_d = pd.to_datetime(e_raw).date()
                 except (ValueError, TypeError):
                     return False
                 if self.sprint_dates is None:
-                    return False  # обратная совместимость
+                    return False
                 sprint_start, sprint_end = self.sprint_dates[sprint_idx]
-                return not (e_d < sprint_start or s_d > sprint_end)
+                overlaps = not (e_d < sprint_start or s_d > sprint_end)
+                return not overlaps  # активен, если больничный НЕ пересекается со спринтом
             return True
 
         valid_eng_rows = []
@@ -661,10 +683,15 @@ class SmartScheduler:
                 team = row['team_id']
                 initiative = row['Номер инициативы']
                 sp_needed = float(row['estimation_sp'])
+                task_start_sprint = int(row.get('start_sprint', 1) or 1)
 
                 if task_status.get(t_id) in {'Done', 'Canceled', 'NotTaken'}:
                     continue
                 if t_id in self.invalid_task_ids:
+                    continue
+                if sprint < task_start_sprint:
+                    # Задача не может стартовать раньше указанного спринта.
+                    # Молча пропускаем, чтобы не засорять журнал.
                     continue
                 if t_id in self.invalid_cycle_task_ids:
                     add_log(sprint, row, 'Перенос',
