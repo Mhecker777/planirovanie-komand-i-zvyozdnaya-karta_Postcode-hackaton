@@ -367,7 +367,9 @@ def render_tasks() -> None:
         # Стартовый спринт. По умолчанию — следующий после текущего,
         # чтобы новая задача не могла попасть в уже завершённый спринт.
         _cur_sprint = int(st.session_state.get('_stored_current_sprint') or 0)
-        _default_start = max(1, _cur_sprint + 1)
+        # Ограничиваем 1..6: если текущий спринт = 6, следующего уже нет,
+        # ставим 6 как максимум (задача попадёт в последний спринт квартала).
+        _default_start = min(6, max(1, _cur_sprint + 1))
         new_start_sprint = col6.selectbox(
             'Стартовый спринт',
             options=[1, 2, 3, 4, 5, 6],
