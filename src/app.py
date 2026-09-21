@@ -203,6 +203,30 @@ if not st.session_state.get('_session_logged'):
     storage.log_session(user, 'login')
     st.session_state['_session_logged'] = True
 
+# ---- Панель входа (сайдбар) ----
+st.sidebar.markdown('---')
+st.sidebar.markdown(f"### {fa_text('fa-user-lock', 'Аккаунт')}", unsafe_allow_html=True)
+st.sidebar.caption(f'Вы вошли как **{user.name}** (роль: {user.role})')
+
+with st.sidebar.expander('Сменить роль'):
+    account_ids = list(auth.ACCOUNTS.keys())
+    default_idx = account_ids.index(user.id) if user.id in account_ids else 0
+    picked_id = st.selectbox(
+        'Пользователь:',
+        account_ids,
+        index=default_idx,
+        key='login_role_pick',
+    )
+    pwd = st.text_input('Пароль:', type='password', key='login_pwd')
+    if st.button('Войти', key='login_btn'):
+        new_user = auth.try_login(picked_id, pwd)
+        if new_user is not None:
+            auth.set_current_user(new_user)
+            storage.log_session(new_user, 'role_switch', comment=f'Переключение на {picked_id}')
+            st.rerun()
+        else:
+            st.error('Неверный пароль.')
+
 # ---- Загрузка/восстановление состояния ----
 if 'working_dfs' not in st.session_state:
     restored = storage.load_latest()
