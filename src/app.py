@@ -60,6 +60,15 @@ st.markdown(
         .stTabs [data-baseweb="tab"]:nth-child(5)::before {{ content: "\\f071"; }}
         .stTabs [data-baseweb="tab"]:nth-child(6)::before {{ content: "\\f085"; }}
         .stTabs [data-baseweb="tab"]:nth-child(7)::before {{ content: "\\f1da"; }}
+
+        /* Отключаем Font Awesome иконки для ВЛОЖЕННЫХ st.tabs (подвкладок).
+           Иначе CSS nth-child применяется и к подвкладкам, и они получают
+           иконки главных вкладок — визуально не совпадает с содержимым.
+           Подвкладки рендерятся как .stTabs внутри другого .stTabs. */
+        .stTabs .stTabs [data-baseweb="tab"]::before {{
+            content: none !important;
+            display: none !important;
+        }}
     </style>
     """,
     unsafe_allow_html=True,
