@@ -11,7 +11,7 @@ from parser import DataParser
 
 LOG_COLUMNS = [
     'sprint', 'task_id', 'team', 'initiative', 'action', 'reason', 'reason_code',
-    'donor_team', 'recipient_team', 'role', 'hours'
+    'donor_team', 'recipient_team', 'role', 'hours', 'donor_engineer'
 ]
 
 
@@ -116,6 +116,40 @@ class SmartScheduler:
         if not eng_skills:
             return False
         return any(any(req in sk for sk in eng_skills) for req in required)
+    def _pick_donor_engineer(self, donor_team: str, role: str) -> str:
+        """
+        Выбирает конкретного инженера-донора из команды для перевода по роли.
+
+        Логика выбора:
+        1. Только активные (не Уволен, не Больничный/Отпуск на текущий момент).
+        2. Среди них — с максимальной ставкой capacity_rate.
+        3. При равенстве — лексикографически первый engineer_id.
+
+        Возвращает engineer_id или пустую строку, если подходящих нет.
+        """
+        candidates = self.engineers_df[
+            (self.engineers_df['team_id'] == donor_team)
+            & (self.engineers_df['role_norm'] == role)
+        ]
+        if candidates.empty:
+            return ''
+
+        # Отбираем активных
+        active = candidates[candidates['status'] == 'Активен']
+        if active.empty:
+            # Если активных нет — берём всех, кроме уволенных
+            active = candidates[candidates['status'] != 'Уволен']
+        if active.empty:
+            return ''
+
+        # Сортируем: сначала по убыванию capacity_rate, потом по engineer_id
+        active = active.copy()
+        active['capacity_rate'] = pd.to_numeric(active['capacity_rate'], errors='coerce').fillna(0.0)
+        active = active.sort_values(
+            by=['capacity_rate', 'engineer_id'],
+            ascending=[False, True],
+        )
+        return str(active.iloc[0]['engineer_id']).strip()
 
     def _prepare_data(self):
         """Очистка, валидация и нормализация входных данных."""
@@ -412,7 +446,11 @@ class SmartScheduler:
                 continue
             self.team_role_engineers.setdefault(team, {}).setdefault(role, set()).add(eng_id)
         # 5. СМЕТА
+        # task_estimates — только роли, которые есть в штате (планировщик)
+        # task_estimates_raw — все роли из сметы, включая отсутствующие в штате
+        #                       (для алертов «нет специалистов» и UI)
         self.task_estimates = defaultdict(dict)
+        self.task_estimates_raw = defaultdict(dict)
         if self.estimates_df.empty:
             self._warn('Секция сметы пуста: ни одна задача не имеет постатейной оценки.')
         else:
@@ -438,6 +476,9 @@ class SmartScheduler:
                     if val < 0:
                         self._warn(f"{clean_id}: отрицательная оценка {val:g} ЧЧ для роли «{norm_r or role_name}» проигнорирована.")
                         continue
+                    # Всегда пишем в raw-версию
+                    self.task_estimates_raw[clean_id][norm_r] = self.task_estimates_raw[clean_id].get(norm_r, 0.0) + float(val)
+                    # В планировщик — только если роль есть в штате
                     if norm_r not in self.known_roles:
                         self._warn(f"{clean_id}: роль «{role_name}» отсутствует среди сотрудников; её часы не участвуют в автоматическом планировании.")
                         continue
@@ -458,9 +499,12 @@ class SmartScheduler:
                     f"не совпадает с суммой по ролям в смете ({role_sum:.0f} ЧЧ), "
                     f"расхождение {abs(float(declared_total) - role_sum):.0f} ЧЧ"
                 )
-            if not self.task_estimates.get(t_id):
+            # Разделяем два случая:
+            # 1. Сметы вообще нет — некорректная задача.
+            # 2. Смета есть, но все роли отсутствуют в штате — нет специалистов.
+            if not self.task_estimates_raw.get(t_id):
                 self.bad_estimate_task_ids.add(t_id)
-                self._warn(f"{t_id}: нет ни одной положительной оценки по роли, доступной в штате.")
+                self._warn(f"{t_id}: нет ни одной положительной оценки по роли — некорректная смета.")
 
     def get_data_quality_warnings(self) -> list:
         return list(self.data_quality_warnings)
@@ -576,6 +620,7 @@ class SmartScheduler:
                 'initiative': row.get('Номер инициативы', 'Без инициативы'), 'action': action,
                 'reason': reason, 'reason_code': reason_code,
                 'donor_team': None, 'recipient_team': None, 'role': None, 'hours': 0.0,
+                'donor_engineer': None,
             }
             record.update(extra)
             explain_logs.append(record)
@@ -744,9 +789,18 @@ class SmartScheduler:
                     add_log(sprint, row, 'Перенос', f"Блокируется: {', '.join(blocking)}", 'dependency')
                     continue
 
-                if t_id in self.bad_estimate_task_ids or not remaining_hours.get(t_id):
-                    add_log(sprint, row, 'Перенос',
-                            'Нет полной постатейной оценки по доступным ролям; задача не планируется.', 'bad_estimate')
+                if not remaining_hours.get(t_id):
+                    # Смотрим, есть ли вообще смета (включая отсутствующие роли)
+                    raw_estimates = self.task_estimates_raw.get(t_id, {})
+                    if not raw_estimates:
+                        add_log(sprint, row, 'Перенос',
+                                'Нет постатейной оценки; задача не может быть запланирована.',
+                                'bad_estimate')
+                    else:
+                        missing_roles = ', '.join(sorted(raw_estimates.keys()))
+                        add_log(sprint, row, 'Перенос',
+                                f'Нет специалистов для ролей: {missing_roles}',
+                                'no_specialist')
                     continue
 
                 sp_to_commit = 0.0 if t_id in reserved_sp else sp_needed
@@ -841,11 +895,18 @@ class SmartScheduler:
                         temp[donor_team][role] -= amount
                         temp.setdefault(team, {})[role] = temp.get(team, {}).get(role, 0.0) + amount
                         deficit -= amount
-                        transfers.append({'sprint': sprint, 'task_id': t_id, 'team': team, 'initiative': initiative,
-                                          'action': 'Реорганизация (Перевод)',
-                                          'reason': f"Перевод «{role}» из {donor_team} ({amount:g} ЧЧ)",
-                                          'reason_code': 'transfer', 'donor_team': donor_team,
-                                          'recipient_team': team, 'role': role, 'hours': amount})
+                        donor_eng = self._pick_donor_engineer(donor_team, role)
+                        transfers.append({
+                            'sprint': sprint, 'task_id': t_id, 'team': team, 'initiative': initiative,
+                            'action': 'Реорганизация (Перевод)',
+                            'reason': f"Перевод «{role}» из {donor_team} ({amount:g} ЧЧ)",
+                            'reason_code': 'transfer',
+                            'donor_team': donor_team,
+                            'donor_engineer': donor_eng,
+                            'recipient_team': team,
+                            'role': role,
+                            'hours': amount,
+                        })
                     if deficit > 1e-9:
                         deficit_roles.append(role)
                         sprint_deficits[sprint][role] += deficit

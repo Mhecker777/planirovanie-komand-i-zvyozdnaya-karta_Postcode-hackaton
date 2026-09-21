@@ -224,7 +224,25 @@ def render_engineers() -> None:
 
     st.markdown('---')
     st.markdown('##### ⚡ Массовые действия')
-    selected_ids = st.multiselect('Выбрать инженеров:', eng_df['engineer_id'].tolist(), key='eng_bulk_select')
+
+    # Part-time инженеры (ENG-405, ENG-406, ENG-419, ENG-426) представлены
+    # в датасете двумя строками — по одной на каждую команду. При выборе
+    # «ENG-405» в мультиселекте показывались два одинаковых пункта.
+    # Собираем уникальные ID, но в подписи показываем все команды инженера,
+    # чтобы пользователь понимал, кого именно он выбирает.
+    _eng_by_id = (
+        eng_df.groupby('engineer_id')['team_id']
+        .apply(lambda s: ', '.join(sorted(set(s.dropna().astype(str)))))
+        .to_dict()
+    )
+    _unique_eng_ids = sorted(_eng_by_id.keys())
+    _eng_options = [f'{eid} ({_eng_by_id.get(eid, "")})' for eid in _unique_eng_ids]
+
+    _picked_labels = st.multiselect(
+        'Выбрать инженеров:', options=_eng_options, key='eng_bulk_select'
+    )
+    # Превращаем подписи обратно в engineer_id
+    selected_ids = [lbl.split(' (', 1)[0] for lbl in _picked_labels]
 
     with st.expander('Даты для массовых действий', expanded=False):
         bulk_start = st.date_input('Начало (для больничного/отпуска)', value=date.today(), key='bulk_start')
@@ -263,7 +281,49 @@ def render_engineers() -> None:
 # ==================================================================
 # КОМАНДЫ (раздел 8)
 # ==================================================================
+    st.markdown('---')
+    st.markdown('##### 🗑️ Удалить навсегда (без сохранения истории)')
+    st.caption(
+        'Полное удаление инженера из системы. Используйте осторожно: '
+        'запись исчезнет из `engineers_df`, история в журнале событий '
+        'останется, но Bus Factor и планировщик про него больше не узнают. '
+        'Для обычного увольнения используйте «❌ Уволить» выше — тогда '
+        'инженер останется в системе со статусом «Уволен».'
+    )
 
+    # Ограничим список уволенными — жёсткое удаление имеет смысл только для них.
+    # Активных сначала нужно явно уволить, чтобы случайно не потерять запись.
+    fired_now = eng_df[eng_df['status'] == 'Уволен']
+    if fired_now.empty:
+        st.info('Сначала переведите инженера в статус «Уволен» на вкладке массовых действий — после этого станет доступна кнопка удаления.')
+    else:
+        hard_del_id = st.selectbox(
+            'Кого удалить навсегда:',
+            options=['—'] + fired_now['engineer_id'].tolist(),
+            key='hard_delete_eng_pick',
+        )
+        confirm = st.checkbox(
+            'Подтверждаю: удалить без возможности восстановления',
+            key='hard_delete_eng_confirm',
+        )
+        if hard_del_id != '—' and confirm:
+            if st.button(f'🗑️ Удалить {hard_del_id} навсегда', type='primary'):
+                # Убираем из engineers_df
+                new_eng = eng_df[eng_df['engineer_id'] != hard_del_id].reset_index(drop=True)
+                dfs['engineers_df'] = new_eng
+
+                # Убираем из сметы (estimates_df не хранит инженеров, там роли — но
+                # если вдруг что-то было связано, здесь мы это не трогаем)
+                # Убираем из истории (Team_history связана с командой, не с инженером)
+
+                _stage(
+                    'hard_delete', 'engineer', entity_id=hard_del_id,
+                    old_value={'engineer_id': hard_del_id, 'status': 'Уволен'},
+                    new_value=None,
+                    comment='Полное удаление инженера из системы',
+                )
+                st.success(f'Инженер {hard_del_id} удалён навсегда. Обновите страницу для пересчёта.')
+                st.rerun()
 def render_teams() -> None:
     dfs = _dfs()
     eng_df = dfs['engineers_df']
@@ -453,7 +513,12 @@ def render_tasks() -> None:
     st.markdown('##### ➕ Добавить задачу')
     with st.form('add_task_form', clear_on_submit=True):
         auto_id = _next_task_id(tasks_df)
-        st.text_input('task_id (генерируется автоматически)', value=auto_id, disabled=True)
+        manual_id = st.text_input(
+            'task_id (можно изменить)',
+            value=auto_id,
+            key='add_task_id_input',
+            help='Автогенерируется как NEW-NNN. Можно заменить на свой — например, если задача уже существует во внешней системе.',
+        )
 
         col1, col2, col3 = st.columns(3)
         new_team = col1.selectbox('Команда', _known_teams(dfs), key='add_task_team')
@@ -507,8 +572,10 @@ def render_tasks() -> None:
 
         submitted = st.form_submit_button('Добавить задачу')
         if submitted:
-            new_id_clean = auto_id
-            if not new_team.strip():
+            new_id_clean = (manual_id or '').strip()
+            if not new_id_clean:
+                st.error('task_id не может быть пустым.')
+            elif not new_team.strip():
                 st.error('Команда обязательна.')
             elif new_id_clean in tasks_df['task_id'].astype(str).values:
                 st.error(f'Задача {new_id_clean} уже существует.')
