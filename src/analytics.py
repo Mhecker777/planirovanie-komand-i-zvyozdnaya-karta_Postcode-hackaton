@@ -30,6 +30,21 @@ class StarMapAnalytics:
         else:
             raise ValueError('Нужен либо data_path, либо engineers_df.')
 
+        # Уволенные не должны учитываться в Bus Factor и звёздной карте:
+        # они больше не работают, их компетенции недоступны. Планировщик
+        # их уже исключает, analytics теперь тоже.
+        # Сравниваем регистро- и пробело-устойчиво: статус может прийти
+        # из Excel как 'Уволен', 'уволен' или 'Уволен ' с пробелом.
+        if 'status' in self.engineers.columns:
+            _status_norm = (
+                self.engineers['status']
+                .fillna('Активен')
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+            self.engineers = self.engineers[_status_norm != 'уволен'].copy()
+
         self.engineers['engineer_id'] = self.engineers['engineer_id'].astype(str).str.strip()
         self.engineers['team_id'] = self.engineers['team_id'].astype(str).str.strip()
         self.engineers['role'] = self.engineers['role'].astype(str).str.strip()
