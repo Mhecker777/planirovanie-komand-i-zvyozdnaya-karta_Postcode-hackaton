@@ -98,7 +98,6 @@ def render_unscheduled_table(rows: list[dict]) -> str:
         'Не хватает SP команды': 'fa-chart-column',
         'Дефицит специалистов': 'fa-user-xmark',
         'Нет специалистов в штате': 'fa-user-slash',
-        'Нет специалистов 1С': 'fa-flask',
         'Некорректная смета': 'fa-circle-exclamation',
         'Не указана команда': 'fa-people-group',
         'Цикл зависимостей': 'fa-arrows-rotate',
@@ -233,9 +232,8 @@ if not st.session_state.get('_runtime_loaded'):
     # «Рабочее» значение — источник истины для планировщика. Оно же
     # используется для откатов и для сверки с текущим состоянием чекбокса.
     st.session_state['_ignore_1c_roles_value'] = st.session_state['_stored_ignore_1c_roles']
-    # Синхронизируем чекбокс с восстановленным значением (иначе Streamlit
-    # подставит value= из кода и перезапишет persisted-состояние).
-    st.session_state['ignore_1c_roles_cb'] = st.session_state['_ignore_1c_roles_value']
+    # Засев ключа виджета делается прямо перед его созданием (см. ниже),
+    # здесь его дублировать не нужно.
     st.session_state['_runtime_loaded'] = True
 st.session_state['storage'] = storage
 
@@ -355,18 +353,26 @@ def _cancel_1c_toggle():
     # Возвращаем чекбокс к подтверждённому значению.
     st.session_state['ignore_1c_roles_cb'] = st.session_state['_ignore_1c_roles_value']
 
+# Гарантируем, что ключ виджета есть в session_state до его создания.
+# Это единственный способ подсунуть виджету persisted-значение без
+# конфликта с параметром value= (Streamlit запрещает передавать оба
+# одновременно и ругается предупреждением).
+if 'ignore_1c_roles_cb' not in st.session_state:
+    st.session_state['ignore_1c_roles_cb'] = _persisted_1c
+
 _cb_1c_value = st.sidebar.checkbox(
     'Игнорировать 1С-роли при планировании',
-    value=_persisted_1c,
     key='ignore_1c_roles_cb',
+    # value= НЕ передаём: значение уже сидит в session_state.
     help=(
         'В датасете нет ни одного 1С-инженера, поэтому задачи с 1С-ролями '
         'нельзя выполнить полностью.\n\n'
         '• Галочка ВКЛючена: 1С-роли игнорируются, задача планируется по '
         'остальным ролям.\n'
         '• Галочка СНЯТА: задача с любой 1С-ролью вообще не берётся в план. '
-        'Она попадёт в раздел «Не поместились в квартал» с причиной '
-        '«Нет специалистов 1С».'
+        'Она попадёт в раздел «Не поместились в квартал» с категорией '
+        '«Нет специалистов в штате» и причиной вида «Нет специалистов '
+        'для ролей: Аналитик 1С».'
     ),
 )
 
@@ -1024,7 +1030,6 @@ with tab1:
         'sp_capacity': 'Не хватает SP команды',
         'role_capacity': 'Дефицит специалистов',
         'no_specialist': 'Нет специалистов в штате',
-        'no_1c_specialist': 'Нет специалистов 1С',
         'bad_estimate': 'Некорректная смета',
         'bad_team': 'Не указана команда',
         'dependency_cycle': 'Цикл зависимостей',
@@ -1194,10 +1199,6 @@ with tab3:
 def _alert_kind(alert_type: str) -> str:
     """Нормализует тип алерта, независимо от старого emoji-префикса."""
     value = str(alert_type or '').lower()
-    # 1С-алерты проверяем ДО общей проверки «структурный дефицит» —
-    # иначе они растворятся в общей категории 'brown'.
-    if '1с' in value and 'структурный' in value:
-        return 'cyan'
     if 'срыв' in value or 'ошибка' in value:
         return 'red'
     if 'сдвиг' in value:

@@ -19,6 +19,29 @@ import re
 from datetime import date, timedelta
 
 
+def _is_blank_id(value) -> bool:
+    """True, если значение пустое: NaN, None, pd.NA, '', 'nan', '<NA>' и т.п.
+
+    Не полагаемся на .astype(str), потому что поведение pandas при
+    преобразовании NaN/None/pd.NA в строку различается между версиями
+    и dtype колонки. Сначала проверяем pd.isna() — это покрывает все
+    числовые/объектные/special NaN-like значения. Потом — строковую
+    нормализацию на случай, если значение уже пришло как текст
+    'nan' / '<NA>' / 'None' (например, из Excel).
+    """
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        # pd.isna() может бросить, если пришёл list / dict — считаем
+        # это невалидным ID и отсеиваем.
+        return True
+    s = str(value).strip().lower()
+    return s in {'', 'nan', 'none', 'null', 'n/a', 'na', '<na>'}
+
+
 def _next_engineer_id(eng_df) -> str:
     """ENG-NNN — следующая свободная нумерация."""
     max_n = 0
@@ -794,6 +817,23 @@ def render_dependencies() -> None:
     tasks_df = dfs['tasks_df']
     task_ids = tasks_df['task_id'].astype(str).tolist()
 
+    # В deps_df могут быть связи, ссылающиеся на задачи, которых нет в Tasks
+    # (например, SRV-4013 → SRV-4014, когда ни той, ни другой нет в Task-секции).
+    # Планировщик их игнорирует и пишет warning, но из deps_df они не удаляются.
+    #
+    # Streamlit SelectboxColumn не может показать значение, которого нет
+    # в options — вместо него рисуется пустое поле. Чтобы «висячие» ID были
+    # видны и редактируемы, добавляем их в options вместе с валидными.
+    _deps_ids = set()
+    for _col in ('blocking_task_id', 'blocked_task_id'):
+        if _col in deps_df.columns:
+            _deps_ids.update(
+                deps_df[_col].dropna().astype(str).str.strip().tolist()
+            )
+    # Убираем пустышки и мусор
+    _deps_ids = {x for x in _deps_ids if x and x.lower() not in {'nan', 'none', 'null', '<na>'}}
+    task_ids = sorted(set(task_ids) | _deps_ids)
+
     st.markdown('##### ➕ Добавить связь')
     with st.form('add_dep_form', clear_on_submit=True):
         col1, col2, col3 = st.columns(3)
@@ -823,13 +863,20 @@ def render_dependencies() -> None:
     # Чистим пустые строки — могли попасть из Excel/парсера или быть
     # случайно добавлены пользователем в data_editor.
     deps_clean = deps_df.copy()
+    # Фильтруем пустые строки через pd.isna() + строковую нормализацию.
+    # Применяем маску ДО приведения к строке, чтобы NaN / None / pd.NA
+    # отсеивались на уровне pandas, а не через astype(str), поведение
+    # которого нестабильно между версиями.
+    mask_blank = (
+        deps_clean['blocking_task_id'].apply(_is_blank_id)
+        | deps_clean['blocked_task_id'].apply(_is_blank_id)
+    )
+    deps_clean = deps_clean[~mask_blank].reset_index(drop=True)
+    # Приводим рабочие значения к строке — теперь, когда мусор удалён,
+    # astype(str) не испортит реальные ID.
     for col in ('blocking_task_id', 'blocked_task_id'):
         if col in deps_clean.columns:
             deps_clean[col] = deps_clean[col].astype(str).str.strip()
-    deps_clean = deps_clean[
-        (~deps_clean['blocking_task_id'].isin(['', 'nan', 'None', 'null']))
-        & (~deps_clean['blocked_task_id'].isin(['', 'nan', 'None', 'null']))
-    ].reset_index(drop=True)
 
     # Если в объекте DataFrame появились лишние пустые строки — обновим рабочее состояние
     if len(deps_clean) != len(deps_df):
@@ -847,15 +894,17 @@ def render_dependencies() -> None:
         },
     )
     if st.button('Применить правки в таблице связей'):
-        # Отфильтруем пустые строки, которые пользователь мог добавить, но не заполнить.
+        # Тот же фильтр, что и при чтении. Используем _is_blank_id —
+        # он ловит и NaN/None/pd.NA, и строковые заглушки 'nan'/'<NA>'.
         edited = edited.copy()
+        mask_blank = (
+            edited['blocking_task_id'].apply(_is_blank_id)
+            | edited['blocked_task_id'].apply(_is_blank_id)
+        )
+        edited = edited[~mask_blank].reset_index(drop=True)
         for col in ('blocking_task_id', 'blocked_task_id'):
             if col in edited.columns:
                 edited[col] = edited[col].astype(str).str.strip()
-        edited = edited[
-            (~edited['blocking_task_id'].isin(['', 'nan', 'None', 'null']))
-            & (~edited['blocked_task_id'].isin(['', 'nan', 'None', 'null']))
-        ].reset_index(drop=True)
         cycle = _has_cycle(edited)
         if cycle:
             st.error(f'После этих правок появляется цикл зависимостей: {" → ".join(c[0] for c in cycle)}. Правки не применены.')
