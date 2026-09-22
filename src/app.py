@@ -87,8 +87,11 @@ def fa_text(icon: str, text: str) -> str:
 
 
 def render_unscheduled_table(rows: list[dict]) -> str:
-    """Рендерит таблицу с Font Awesome иконками в колонке «Категория»."""
-    headers = ['Задача', 'Rung', 'Инициатива', 'Команда', 'Категория', 'Причина']
+    """Рендерит таблицу с Font Awesome иконками в колонке «Категория».
+    Колонка «Прогноз» показывает, в каком спринте задача завершится
+    (для тех, что в плане) или что не завершится в квартале."""
+    headers = ['Задача', 'Rung', 'Инициатива', 'Команда',
+               'Категория', 'Прогноз', 'Причина']
     parts = ['<div class="fa-table-wrap"><table class="fa-table"><thead><tr>']
     parts.extend(f'<th>{escape(h)}</th>' for h in headers)
     parts.append('</tr></thead><tbody>')
@@ -112,10 +115,27 @@ def render_unscheduled_table(rows: list[dict]) -> str:
     for row in rows:
         category = str(row.get('Категория', 'Другое'))
         icon = fa_icon(icon_map.get(category, 'fa-circle-question'))
+        forecast = str(row.get('Прогноз', ''))
+        # Подсветка прогноза: зелёный — задача завершится до конца квартала,
+        # красный — не завершится или впритык к последнему спринту.
+        if forecast.startswith('❌') or forecast.startswith('⚠️'):
+            forecast_html = (
+                f'<span style="color:#e74c3c;font-weight:600;">'
+                f'{escape(forecast)}</span>'
+            )
+        elif forecast.startswith('✅'):
+            forecast_html = (
+                f'<span style="color:#27ae60;">{escape(forecast)}</span>'
+            )
+        else:
+            forecast_html = escape(forecast)
+
         parts.append('<tr>')
         for h in headers:
             if h == 'Категория':
                 parts.append(f'<td>{icon}{escape(category)}</td>')
+            elif h == 'Прогноз':
+                parts.append(f'<td>{forecast_html}</td>')
             else:
                 parts.append(f'<td>{escape(str(row.get(h, "")))}</td>')
         parts.append('</tr>')
@@ -244,6 +264,11 @@ if not st.session_state.get('_runtime_loaded'):
     # Принудительные задачи вне плана: {task_id: {'sprints': [...], 'comment': '...'}}.
     st.session_state['_forced_schedule_value'] = dict(
         _stored_runtime.get('forced_schedule', {}) or {}
+    )
+    # Режим сплиттинга: по умолчанию выключен (строгий режим —
+    # задача не начинается без полного покрытия ролей).
+    st.session_state['_allow_splitting_value'] = bool(
+        _stored_runtime.get('allow_splitting', False)
     )
     st.session_state['_runtime_loaded'] = True
 st.session_state['storage'] = storage
@@ -423,6 +448,28 @@ if ignore_1c_roles:
 else:
     st.sidebar.caption('Режим: задачи с 1С-ролями **снимаются с плана**.')
 
+# --- Режим сплиттинга ---
+allow_splitting = st.sidebar.checkbox(
+    'Разрешить сплиттинг больших задач',
+    value=bool(st.session_state.get('_allow_splitting_value', False)),
+    key='allow_splitting_cb',
+    help=(
+        'Управляет поведением, когда по одной или нескольким ролям не хватает '
+        'часов даже после попытки привлечь доноров.\n\n'
+        '• Галочка СНЯТА (по умолчанию): строгий режим. Задача не начинается, '
+        'пока хотя бы одна роль не покрыта целиком. Она ждёт следующего '
+        'спринта — там состав может быть свободнее.\n'
+        '• Галочка ВКЛючена: сплиттинг. Задача делает доступную часть работы '
+        'в этом спринте, остаток переносится на следующий. SP списываются '
+        'один раз — при первом включении задачи в план.'
+    ),
+)
+st.session_state['_allow_splitting_value'] = bool(allow_splitting)
+if allow_splitting:
+    st.sidebar.caption('Режим: сплиттинг **разрешён**.')
+else:
+    st.sidebar.caption('Режим: **строгий** — задача целиком или ждёт.')
+
 # ===== ПЛАНИРОВЩИКИ =====
 working_dfs = st.session_state['working_dfs']
 committed_dfs = st.session_state['committed_dfs']
@@ -431,12 +478,14 @@ sched = SmartScheduler(
     **working_dfs,
     sprint_dates=sprint_dates_for_sched,
     ignore_1c_roles=ignore_1c_roles,
+    allow_splitting=allow_splitting,
 )
 analytics = StarMapAnalytics(engineers_df=working_dfs['engineers_df'])
 baseline_sched = SmartScheduler(
     **committed_dfs,
     sprint_dates=sprint_dates_for_sched,
     ignore_1c_roles=ignore_1c_roles,
+    allow_splitting=allow_splitting,
 )
 b_schedule, b_statuses, b_logs, b_alerts, b_kpis, b_burned = baseline_sched.run_smart_planning()
 
@@ -652,8 +701,8 @@ _current_runtime = {
     'quarter_start_value': quarter_start.isoformat() if quarter_start else None,
     'ignore_1c_roles': bool(st.session_state.get('_ignore_1c_roles_value', True)),
     'forbidden_donors': [list(pair) for pair in _forbidden_snapshot],
-    # Принудительные задачи вне плана: {task_id: {'sprints': [...], 'comment': '...'}}
     'forced_schedule': _forced_schedule_now,
+    'allow_splitting': bool(st.session_state.get('_allow_splitting_value', False)),
 }
 _runtime_hash = hash((
     _current_runtime['current_time_sprint'],
@@ -662,6 +711,7 @@ _runtime_hash = hash((
     _current_runtime['ignore_1c_roles'],
     tuple(_forbidden_snapshot),
     _forced_snapshot,
+    _current_runtime['allow_splitting'],
 ))
 if st.session_state.get('_last_runtime_hash') != _runtime_hash:
     storage.save_runtime(_current_runtime)
@@ -671,6 +721,7 @@ if st.session_state.get('_last_runtime_hash') != _runtime_hash:
     st.session_state['_stored_quarter_start_iso'] = _current_runtime['quarter_start_value']
     st.session_state['_stored_ignore_1c_roles'] = _current_runtime['ignore_1c_roles']
     st.session_state['_stored_forbidden_donors'] = _current_runtime['forbidden_donors']
+    st.session_state['_stored_allow_splitting'] = _current_runtime['allow_splitting']
 
 # ===== ВАЛИДАЦИЯ ФАКТИЧЕСКИХ ЗАВИСИМОСТЕЙ =====
 _done_statuses = {'done', 'completed', 'завершена', 'завершено', 'готово', 'выполнена', 'выполнено'}
@@ -1120,6 +1171,28 @@ with tab1:
         for _item in _items:
             tasks_in_plan.add(_item['task_id'])
 
+    # Прогнозная дата завершения для каждой задачи в плане: последний
+    # спринт, в котором задача встречается. Если задача растянута на
+    # несколько спринтов — берём максимальный.
+    task_last_sprint = {}
+    for _sprint, _items in c_schedule.items():
+        for _item in _items:
+            _tid = _item['task_id']
+            _prev = task_last_sprint.get(_tid, 0)
+            if _sprint > _prev:
+                task_last_sprint[_tid] = _sprint
+
+    # Прогнозная дата в терминах календаря (для подписи в UI).
+    def _forecast_label(tid):
+        if tid not in task_last_sprint:
+            return '❌ не завершится в квартале'
+        last_sp = task_last_sprint[tid]
+        _, end_date = sprint_date_ranges[last_sp]
+        # Если задача в последнем спринте квартала — помечаем как «впритык».
+        if last_sp == 6:
+            return f'⚠️ Спринт {last_sp} (впритык, до {end_date:%d.%m})'
+        return f'✅ Спринт {last_sp} (до {end_date:%d.%m})'
+
     continuing_rows = []
     not_fit_rows = []
 
@@ -1144,7 +1217,9 @@ with tab1:
             'Задача': tid, 'Rung': row.get('rung', 0),
             'Инициатива': row.get('Номер инициативы', 'Без инициативы'),
             'Команда': row.get('team_id', ''),
-            'Категория': category, 'Причина': reason_text,
+            'Категория': category,
+            'Прогноз': _forecast_label(tid),
+            'Причина': reason_text,
         }
         if tid in tasks_in_plan:
             continuing_rows.append(record)
@@ -1221,6 +1296,137 @@ with tab2:
                 }),
                 use_container_width=True, hide_index=True,
             )
+
+    # ===== ПРОФИЛЬ КОМАНДЫ =====
+    st.markdown('---')
+    st.markdown(f"##### {fa_text('fa-people-group', 'Профиль команды')}", unsafe_allow_html=True)
+    st.caption(
+        'Агрегированная карточка: состав, покрытие ролей, утилизация, '
+        'критичные роли и критичные навыки в одном месте.'
+    )
+
+    _profile_teams = sorted(
+        emp_df['Команда'].dropna().astype(str).unique().tolist()
+    ) if not emp_df.empty else []
+    _profile_teams = [t for t in _profile_teams if t and t.lower() != 'nan']
+
+    if not _profile_teams:
+        st.info('Нет данных по командам.')
+    else:
+        _picked_team = st.selectbox(
+            'Команда:', options=_profile_teams, key='team_profile_pick',
+        )
+
+        # --- Собираем данные по выбранной команде ---
+        _team_emp = emp_df[emp_df['Команда'] == _picked_team].copy()
+        _team_role_engineers = sched.team_role_engineers.get(_picked_team, {})
+        _team_role_hours = sched.team_role_hours.get(_picked_team, {})
+
+        # Критичные роли: 1 сотрудник в команде на эту роль
+        _single_role_mask = (
+            (roles_df['Команда'] == _picked_team)
+            & (roles_df['Кол-во сотрудников'] == 1)
+        ) if not roles_df.empty else None
+        _single_roles = (
+            roles_df[_single_role_mask]['Роль'].tolist()
+            if _single_role_mask is not None else []
+        )
+
+        # Критичные навыки (BF=1) внутри этой команды
+        _bf_local_df = analytics.get_bus_factor_by_team()
+        _team_critical_skills = (
+            _bf_local_df[
+                (_bf_local_df['Команда'] == _picked_team)
+                & (_bf_local_df['Bus Factor команды'] == 1)
+            ] if not _bf_local_df.empty else pd.DataFrame()
+        )
+
+        # Средняя утилизация команды
+        _util_vals = pd.to_numeric(
+            _team_emp['Утилизация (%)'].astype(str).str.rstrip('%'),
+            errors='coerce',
+        ).dropna()
+        _avg_util = float(_util_vals.mean()) if not _util_vals.empty else 0.0
+
+        # --- KPI-карточки ---
+        kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+        kc1.metric('Инженеров', len(_team_emp))
+        kc2.metric('Ролей', _team_emp['Роль'].nunique())
+        kc3.metric(
+            'Ролей с 1 сотрудником',
+            len(_single_roles),
+            delta=None if not _single_roles else '⚠️ критично',
+            delta_color='inverse',
+        )
+        kc4.metric('Критичных навыков (BF=1)', len(_team_critical_skills))
+        kc5.metric('Ср. утилизация', f'{_avg_util:.1f}%')
+
+        # --- Предупреждения по рискам ---
+        if _single_roles:
+            st.warning(
+                '⚠️ **Роли с одним сотрудником.** Уход или отпуск этого '
+                'специалиста остановит задачи, требующие роли: '
+                + ', '.join(f'`{r}`' for r in _single_roles) + '.'
+            )
+        if not _team_critical_skills.empty:
+            _crit_skill_names = _team_critical_skills['Технология / Компетенция'].tolist()
+            st.info(
+                f'🔍 **Критичные навыки в команде ({len(_crit_skill_names)}).** '
+                f'Ими владеет только один инженер команды — риск при уходе: '
+                + ', '.join(f'`{s}`' for s in _crit_skill_names[:5])
+                + ('…' if len(_crit_skill_names) > 5 else '.')
+            )
+        if not _single_roles and _team_critical_skills.empty:
+            st.success('Команда устойчива: критичных ролей и навыков нет.')
+
+        # --- Подробности в expander-ах ---
+        _exp1, _exp2, _exp3 = st.columns(3)
+
+        with _exp1:
+            with st.expander(f'👥 Состав команды ({len(_team_emp)})', expanded=False):
+                _team_emp_view = _team_emp[[
+                    'Инженер', 'Роль', 'Статус', 'Ставка',
+                    'Доступно (ЧЧ/кв)', 'Утилизация (%)',
+                ]].rename(columns={'Инженер': 'Инженер'})
+                st.dataframe(
+                    _team_emp_view, use_container_width=True, hide_index=True,
+                )
+
+        with _exp2:
+            with st.expander(f'🎯 Покрытие ролей ({len(_team_role_hours)})', expanded=False):
+                _role_rows = []
+                for _role in sorted(_team_role_hours.keys()):
+                    _eng_set = _team_role_engineers.get(_role, set())
+                    _role_rows.append({
+                        'Роль': _role,
+                        'Инженеров': len(_eng_set),
+                        'ЧЧ/спринт (сумма)': round(float(_team_role_hours[_role]), 1),
+                        'Критично': '⚠️ да' if _role in _single_roles else '—',
+                    })
+                if _role_rows:
+                    _role_df = pd.DataFrame(_role_rows).sort_values(
+                        by=['Критично', 'Роль'], ascending=[False, True],
+                    )
+                    st.dataframe(_role_df, use_container_width=True, hide_index=True)
+                else:
+                    st.caption('Нет данных по ролям.')
+
+        with _exp3:
+            with st.expander(
+                f'⚠️ Критичные навыки ({len(_team_critical_skills)})',
+                expanded=False,
+            ):
+                if _team_critical_skills.empty:
+                    st.caption('Нет критичных навыков в команде.')
+                else:
+                    st.dataframe(
+                        _team_critical_skills[[
+                            'Технология / Компетенция',
+                            'Bus Factor команды',
+                            'Специалисты в команде',
+                        ]],
+                        use_container_width=True, hide_index=True,
+                    )
 
     st.markdown('---')
     st.markdown('##### Историческая стабильность команд')

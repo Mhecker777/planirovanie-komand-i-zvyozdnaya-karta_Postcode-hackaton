@@ -69,7 +69,8 @@ class SmartScheduler:
     def __init__(self, data_path: str = None, *, tasks_df=None, estimates_df=None,
                  deps_df=None, engineers_df=None, history_df=None,
                  team_overrides_df=None, sprint_dates=None,
-                 ignore_1c_roles: bool = True):
+                 ignore_1c_roles: bool = True,
+                 allow_splitting: bool = False):
         """
         sprint_dates: dict[int, tuple[date, date]] — опционально. Если передан,
         больничные/отпуска учитываются поспринтово (инженер выпадает только
@@ -79,6 +80,10 @@ class SmartScheduler:
         """
         self.sprint_dates = sprint_dates
         self.ignore_1c_roles = bool(ignore_1c_roles)
+        # Разрешить сплиттинг: если True — задача делает доступную часть
+        # работы и переносит остаток. Если False — задача не начинается,
+        # пока хотя бы одна роль не покрыта целиком (строгий режим).
+        self.allow_splitting = bool(allow_splitting)
         provided = [tasks_df, estimates_df, deps_df, engineers_df, history_df]
         if all(df is not None for df in provided):
             self.data_path = data_path
@@ -1013,20 +1018,37 @@ class SmartScheduler:
                         sprint_deficits[sprint][role] += deficit
 
                 if deficit_roles:
-                    # СТРОГИЙ РЕЖИМ: не начинаем задачу, если хотя бы одна
-                    # роль не покрыта полностью. Раньше здесь был сплиттинг —
-                    # задача выполняла часть часов и растягивалась на спринты.
-                    # Это тратило ресурсы, но не давало результата: заказчик
-                    # не получал ничего цельного, а «голодная» роль висела
-                    # до конца квартала. Теперь задача ждёт следующего спринта
-                    # — там состав может быть свободнее (другие задачи уже
-                    # завершились, освободили ЧЧ).
-                    add_log(
-                        sprint, row, 'Перенос',
-                        f"Нет полного покрытия ролей: {', '.join(sorted(deficit_roles))}",
-                        'incomplete_coverage',
-                    )
-                    continue
+                    if not self.allow_splitting:
+                        # СТРОГИЙ РЕЖИМ (по умолчанию): задача не начинается,
+                        # если хотя бы одна роль не покрыта полностью. Она
+                        # ждёт следующего спринта, где состав может быть
+                        # свободнее (другие задачи уже завершились,
+                        # освободили ЧЧ).
+                        add_log(
+                            sprint, row, 'Перенос',
+                            f"Нет полного покрытия ролей: {', '.join(sorted(deficit_roles))}",
+                            'incomplete_coverage',
+                        )
+                        continue
+
+                    # РЕЖИМ СПЛИТТИНГА: задача выполняется частично, остаток
+                    # переносится на следующий спринт. Проверяем, что вообще
+                    # есть хоть какие-то доступные часы — иначе задача не
+                    # начнётся и уйдёт на следующий спринт как role_capacity.
+                    total_available = 0.0
+                    for role, needed in req_hours.items():
+                        available = temp.get(team, {}).get(role, 0.0)
+                        total_available += min(
+                            max(0.0, float(needed)),
+                            max(0.0, available),
+                        )
+                    if total_available <= 1e-9:
+                        add_log(
+                            sprint, row, 'Перенос',
+                            f"Глобальный дефицит специалистов: {', '.join(sorted(deficit_roles))}",
+                            'role_capacity',
+                        )
+                        continue
 
                 team_hours_pool = temp
                 explain_logs.extend(transfers)
