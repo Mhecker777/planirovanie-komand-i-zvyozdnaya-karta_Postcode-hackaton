@@ -64,11 +64,15 @@ if not exist "%REQ_FILE%" (
 )
 
 set NEEDS_INSTALL=0
+set INSTALL_REASON=
 
 "!VENV_PYTHON!" -c "import streamlit, pandas, numpy, plotly, networkx, openpyxl" >nul 2>&1
 if errorlevel 1 (
-    echo [INFO] Some libraries are missing or broken.
     set NEEDS_INSTALL=1
+    set INSTALL_REASON=some libraries are missing or broken
+    echo [CHECK] Import test: FAILED - !INSTALL_REASON!
+) else (
+    echo [CHECK] Import test: OK - all libraries are importable
 )
 
 set REQ_HASH_FILE=%VENV_DIR%\.req_hash
@@ -85,33 +89,42 @@ if exist "%REQ_HASH_FILE%" (
 )
 
 if not "!CURR_HASH!"=="!SAVED_HASH!" (
-    echo [INFO] requirements.txt changed - updating dependencies.
     set NEEDS_INSTALL=1
+    set INSTALL_REASON=requirements.txt changed
+    echo [CHECK] Hash of requirements.txt: DIFFERENT - !INSTALL_REASON!
+) else (
+    echo [CHECK] Hash of requirements.txt: SAME as last install
 )
 
 if "!NEEDS_INSTALL!"=="1" (
     echo.
     echo ============================================================
+    echo   [INSTALL START]
+    echo   Reason: !INSTALL_REASON!
     echo   Installing libraries. This will take 1-3 minutes.
     echo   Please wait and do not close this window.
     echo ============================================================
     echo.
-    "!VENV_PYTHON!" -m pip install --disable-pip-version-check -r "%REQ_FILE%"
+    "!VENV_PYTHON!" -m pip install --disable-pip-version-check --progress-bar off -r "%REQ_FILE%"
     if errorlevel 1 (
         echo.
-        echo [ERROR] Failed to install dependencies.
-        echo Check your internet connection.
+        echo ============================================================
+        echo   [INSTALL FAILED]
+        echo   Check your internet connection or the pip output above.
+        echo ============================================================
         pause
         exit /b 1
     )
     echo !CURR_HASH!> "%REQ_HASH_FILE%"
     echo.
-    echo [OK] Libraries installed.
+    echo ============================================================
+    echo   [INSTALL DONE] - libraries installed successfully.
+    echo ============================================================
 ) else (
     echo [OK] Libraries are up to date - no installation needed.
 )
 
-REM ---------- 4. Check dataset.xlsx ----------
+REM ---------- 4. Check dataset.xlsx (warning only, no pause) ----------
 set DATASET_FOUND=0
 if exist "data\dataset.xlsx" set DATASET_FOUND=1
 if exist "dataset.xlsx" set DATASET_FOUND=1
@@ -121,8 +134,8 @@ if "!DATASET_FOUND!"=="0" (
     echo.
     echo [WARNING] dataset.xlsx not found.
     echo Put it into "data\" folder or into project root.
+    echo The app will start but the plan cannot be built until the file appears.
     echo.
-    pause
 )
 
 REM ---------- 5. Find app.py ----------
