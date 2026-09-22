@@ -14,6 +14,22 @@ LOG_COLUMNS = [
     'donor_team', 'recipient_team', 'role', 'hours', 'donor_engineer'
 ]
 
+# Роли 1С-направления. В предоставленном датасете инженеров с этими ролями
+# нет, поэтому часы в смете по ним всегда «повисают» — задача не может быть
+# выполнена по этим ролям.
+#
+# Флаг ignore_1c_roles управляет поведением:
+#   True  (по умолчанию) — 1С-роли просто игнорируются, задача планируется
+#                          по остальным ролям (старое поведение);
+#   False — задача с любой 1С-ролью вообще не берётся в план и попадает
+#           в «Не поместились в квартал» с причиной «Нет специалистов 1С».
+_1C_ROLE_NAMES = {
+    'Аналитик 1С',
+    'Разработчик 1С',
+    'Архитектор 1С',
+    'Специалист поддержки 1С',
+}
+
 
 def normalize_role_name(role) -> str:
     """Нормализует роль; пропуски возвращаются как пустая строка."""
@@ -51,7 +67,8 @@ class SmartScheduler:
 
     def __init__(self, data_path: str = None, *, tasks_df=None, estimates_df=None,
                  deps_df=None, engineers_df=None, history_df=None,
-                 team_overrides_df=None, sprint_dates=None):
+                 team_overrides_df=None, sprint_dates=None,
+                 ignore_1c_roles: bool = True):
         """
         sprint_dates: dict[int, tuple[date, date]] — опционально. Если передан,
         больничные/отпуска учитываются поспринтово (инженер выпадает только
@@ -60,6 +77,7 @@ class SmartScheduler:
         (обратная совместимость с прежним поведением).
         """
         self.sprint_dates = sprint_dates
+        self.ignore_1c_roles = bool(ignore_1c_roles)
         provided = [tasks_df, estimates_df, deps_df, engineers_df, history_df]
         if all(df is not None for df in provided):
             self.data_path = data_path
@@ -157,6 +175,12 @@ class SmartScheduler:
         self.invalid_task_ids = set()
         self.missing_task_team_ids = set()
         self.bad_estimate_task_ids = set()
+
+        # Задачи, в смете которых есть роли 1С. Ключ — task_id,
+        # значение — {role: hours}. Используется для генерации алерта
+        # «СТРУКТУРНЫЙ ДЕФИЦИТ (1С)», если пользователь выключил
+        # ignore_1c_roles.
+        self.tasks_with_1c_roles = defaultdict(dict)
 
         required = {'task_id', 'team_id', 'status', 'rung', 'estimation_sp', 'Номер инициативы'}
         missing = sorted(required - set(self.raw_tasks.columns))
@@ -478,6 +502,20 @@ class SmartScheduler:
                         continue
                     # Всегда пишем в raw-версию
                     self.task_estimates_raw[clean_id][norm_r] = self.task_estimates_raw[clean_id].get(norm_r, 0.0) + float(val)
+                    # 1С-роли всегда отслеживаем отдельно: даже если их
+                    # игнорируем в плане, пользователь должен иметь
+                    # возможность увидеть явный алерт.
+                    if norm_r in _1C_ROLE_NAMES:
+                        self.tasks_with_1c_roles[clean_id][norm_r] = (
+                            self.tasks_with_1c_roles[clean_id].get(norm_r, 0.0) + float(val)
+                        )
+                        if self.ignore_1c_roles:
+                            continue  # тихий режим — не считаем и не алертим
+                        self._warn(
+                            f"{clean_id}: задача требует 1С-специалиста «{norm_r}» "
+                            f"({val:g} ЧЧ), но в компании таких сотрудников нет."
+                        )
+                        continue
                     # В планировщик — только если роль есть в штате
                     if norm_r not in self.known_roles:
                         self._warn(f"{clean_id}: роль «{role_name}» отсутствует среди сотрудников; её часы не участвуют в автоматическом планировании.")
@@ -769,6 +807,19 @@ class SmartScheduler:
                 if task_status.get(t_id) in {'Done', 'Canceled', 'NotTaken'}:
                     continue
                 if t_id in self.invalid_task_ids:
+                    continue
+                # 1С-задачи: если пользователь выключил режим «игнорировать
+                # 1С-роли», задачи с любой 1С-ролью в смете вообще не берутся
+                # в план. Причина — в компании нет ни одного 1С-инженера,
+                # а частично выполнить задачу (по не-1С-ролям) нельзя:
+                # заказчику нужен результат целиком.
+                if not self.ignore_1c_roles and t_id in self.tasks_with_1c_roles:
+                    roles_str = ', '.join(sorted(self.tasks_with_1c_roles[t_id].keys()))
+                    add_log(
+                        sprint, row, 'Перенос',
+                        f'Нет специалистов 1С: {roles_str}',
+                        'no_1c_specialist',
+                    )
                     continue
                 if sprint < task_start_sprint:
                     # Задача не может стартовать раньше указанного спринта.
@@ -1112,6 +1163,11 @@ class SmartScheduler:
                     if norm_r in {'', 'ИТОГО'}:
                         continue
                     if norm_r in self.known_roles:
+                        continue
+                    # 1С-роли обрабатываются отдельным механизмом
+                    # (no_1c_specialist в проходе 1). Исключаем их здесь,
+                    # чтобы не было двойного алерта и двойного сообщения.
+                    if norm_r in _1C_ROLE_NAMES:
                         continue
                     val = pd.to_numeric(source_row[t_id], errors='coerce')
                     if pd.isna(val) or val <= 0:

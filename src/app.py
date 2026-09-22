@@ -98,6 +98,7 @@ def render_unscheduled_table(rows: list[dict]) -> str:
         'Не хватает SP команды': 'fa-chart-column',
         'Дефицит специалистов': 'fa-user-xmark',
         'Нет специалистов в штате': 'fa-user-slash',
+        'Нет специалистов 1С': 'fa-flask',
         'Некорректная смета': 'fa-circle-exclamation',
         'Не указана команда': 'fa-people-group',
         'Цикл зависимостей': 'fa-arrows-rotate',
@@ -142,6 +143,36 @@ h3, h4, h5 { margin-top: 0.6rem; }
 .fa-table th, .fa-table td { padding: 8px 10px; border-bottom: 1px solid rgba(128,128,128,.2); text-align: left; vertical-align: top; }
 .fa-table th { font-weight: 600; }
 .fa-table .fa-ui-icon { margin-right: 0.35em; }
+
+/* ─── Скролл вкладок ─────────────────────────────────────────── */
+/* 7 длинных вкладок («Управление данными», «Журнал событий» и др.)
+   не влезают в узкое окно. Разрешаем горизонтальный скролл вместо
+   обрезания и запрещаем flex-перенос на вторую строку. */
+.stTabs [data-baseweb="tab-list"] {
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    flex-wrap: nowrap !important;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(128,128,128,.45) transparent;
+}
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar {
+    height: 6px;
+}
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar-track {
+    background: transparent;
+}
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar-thumb {
+    background: rgba(128,128,128,.45);
+    border-radius: 3px;
+}
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar-thumb:hover {
+    background: rgba(128,128,128,.7);
+}
+.stTabs [data-baseweb="tab"] {
+    flex-shrink: 0 !important;
+    white-space: nowrap;
+}
+/* ────────────────────────────────────────────────────────────── */
 </style>
 ''',
     unsafe_allow_html=True,
@@ -194,6 +225,17 @@ if not st.session_state.get('_runtime_loaded'):
     st.session_state['_stored_current_sprint'] = _stored_runtime.get('current_time_sprint')
     st.session_state['_stored_fact'] = _stored_runtime.get('fact_sprint_done', {}) or {}
     st.session_state['_stored_quarter_start_iso'] = _stored_runtime.get('quarter_start_value')
+    # Флаг «игнорировать 1С-роли» тоже персистим между сессиями. По умолчанию True
+    # (старое поведение — 1С-роли игнорируются, задачи планируются по остальным).
+    st.session_state['_stored_ignore_1c_roles'] = bool(
+        _stored_runtime.get('ignore_1c_roles', True)
+    )
+    # «Рабочее» значение — источник истины для планировщика. Оно же
+    # используется для откатов и для сверки с текущим состоянием чекбокса.
+    st.session_state['_ignore_1c_roles_value'] = st.session_state['_stored_ignore_1c_roles']
+    # Синхронизируем чекбокс с восстановленным значением (иначе Streamlit
+    # подставит value= из кода и перезапишет persisted-состояние).
+    st.session_state['ignore_1c_roles_cb'] = st.session_state['_ignore_1c_roles_value']
     st.session_state['_runtime_loaded'] = True
 st.session_state['storage'] = storage
 
@@ -293,13 +335,92 @@ def sprint_label(i: int) -> str:
 
 sprint_dates_for_sched = {i: sprint_date_ranges[i] for i in range(1, 7)}
 
+# ===== НАСТРОЙКИ ПЛАНИРОВАНИЯ =====
+st.sidebar.markdown('---')
+st.sidebar.markdown(f"### {fa_text('fa-user-shield', 'Настройки планирования')}", unsafe_allow_html=True)
+
+# Подтверждённое (persisted) значение — источник истины для планировщика.
+_persisted_1c = bool(st.session_state.get('_ignore_1c_roles_value', True))
+
+# Колбэки смены режима. Выполняются ДО инстанцирования виджета на
+# следующем rerun, поэтому присвоение session_state с ключом виджета
+# безопасно (иначе Streamlit бросил бы "cannot be modified after widget
+# is instantiated").
+def _confirm_1c_toggle():
+    new_val = bool(st.session_state.get('ignore_1c_roles_cb', True))
+    st.session_state['_ignore_1c_roles_value'] = new_val
+    st.session_state['_stored_ignore_1c_roles'] = new_val
+
+def _cancel_1c_toggle():
+    # Возвращаем чекбокс к подтверждённому значению.
+    st.session_state['ignore_1c_roles_cb'] = st.session_state['_ignore_1c_roles_value']
+
+_cb_1c_value = st.sidebar.checkbox(
+    'Игнорировать 1С-роли при планировании',
+    value=_persisted_1c,
+    key='ignore_1c_roles_cb',
+    help=(
+        'В датасете нет ни одного 1С-инженера, поэтому задачи с 1С-ролями '
+        'нельзя выполнить полностью.\n\n'
+        '• Галочка ВКЛючена: 1С-роли игнорируются, задача планируется по '
+        'остальным ролям.\n'
+        '• Галочка СНЯТА: задача с любой 1С-ролью вообще не берётся в план. '
+        'Она попадёт в раздел «Не поместились в квартал» с причиной '
+        '«Нет специалистов 1С».'
+    ),
+)
+
+# Если текущее состояние чекбокса расходится с подтверждённым — показываем
+# блок подтверждения. Планировщик до подтверждения использует прежнее
+# значение, чтобы случайный клик не перекроил план.
+if _cb_1c_value != _persisted_1c:
+    _mode_now = 'игнорировать 1С-роли' if _persisted_1c else 'снимать 1С-задачи с плана'
+    _mode_new = 'игнорировать 1С-роли' if _cb_1c_value else 'снимать 1С-задачи с плана'
+    st.sidebar.warning(
+        f'⚠️ **Подтверждение смены режима**\n\n'
+        f'Сейчас: {_mode_now}.\n\n'
+        f'Станет: **{_mode_new}**.\n\n'
+        f'План будет пересчитан только после подтверждения.'
+    )
+    _col_ok, _col_cancel = st.sidebar.columns(2)
+    _col_ok.button(
+        '✅ Подтвердить',
+        key='confirm_1c_toggle',
+        on_click=_confirm_1c_toggle,
+        use_container_width=True,
+        type='primary',
+    )
+    _col_cancel.button(
+        '↩️ Отмена',
+        key='cancel_1c_toggle',
+        on_click=_cancel_1c_toggle,
+        use_container_width=True,
+    )
+    # До подтверждения — прежний режим.
+    ignore_1c_roles = _persisted_1c
+else:
+    ignore_1c_roles = _persisted_1c
+
+if ignore_1c_roles:
+    st.sidebar.caption('Режим: 1С-роли **игнорируются**, задачи планируются.')
+else:
+    st.sidebar.caption('Режим: задачи с 1С-ролями **снимаются с плана**.')
+
 # ===== ПЛАНИРОВЩИКИ =====
 working_dfs = st.session_state['working_dfs']
 committed_dfs = st.session_state['committed_dfs']
 
-sched = SmartScheduler(**working_dfs, sprint_dates=sprint_dates_for_sched)
+sched = SmartScheduler(
+    **working_dfs,
+    sprint_dates=sprint_dates_for_sched,
+    ignore_1c_roles=ignore_1c_roles,
+)
 analytics = StarMapAnalytics(engineers_df=working_dfs['engineers_df'])
-baseline_sched = SmartScheduler(**committed_dfs, sprint_dates=sprint_dates_for_sched)
+baseline_sched = SmartScheduler(
+    **committed_dfs,
+    sprint_dates=sprint_dates_for_sched,
+    ignore_1c_roles=ignore_1c_roles,
+)
 b_schedule, b_statuses, b_logs, b_alerts, b_kpis, b_burned = baseline_sched.run_smart_planning()
 
 bf_df = analytics.get_bus_factor_and_training()
@@ -501,11 +622,16 @@ _current_runtime = {
     'current_time_sprint': current_time_sprint,
     'fact_sprint_done': fact_sprint_done,
     'quarter_start_value': quarter_start.isoformat() if quarter_start else None,
+    # Флаг «игнорировать 1С-роли». Кладём в runtime, чтобы он переживал
+    # перезапуск приложения и обновление страницы (F5). Изменение этого
+    # поля включается в хеш — иначе смена режима не триггерила бы save_runtime.
+    'ignore_1c_roles': bool(st.session_state.get('_ignore_1c_roles_value', True)),
 }
 _runtime_hash = hash((
     _current_runtime['current_time_sprint'],
     tuple(sorted(_current_runtime['fact_sprint_done'].items())),
     _current_runtime['quarter_start_value'],
+    _current_runtime['ignore_1c_roles'],
 ))
 if st.session_state.get('_last_runtime_hash') != _runtime_hash:
     storage.save_runtime(_current_runtime)
@@ -513,6 +639,7 @@ if st.session_state.get('_last_runtime_hash') != _runtime_hash:
     st.session_state['_stored_current_sprint'] = current_time_sprint
     st.session_state['_stored_fact'] = dict(fact_sprint_done)
     st.session_state['_stored_quarter_start_iso'] = _current_runtime['quarter_start_value']
+    st.session_state['_stored_ignore_1c_roles'] = _current_runtime['ignore_1c_roles']
 
 # ===== ВАЛИДАЦИЯ ФАКТИЧЕСКИХ ЗАВИСИМОСТЕЙ =====
 _done_statuses = {'done', 'completed', 'завершена', 'завершено', 'готово', 'выполнена', 'выполнено'}
@@ -718,6 +845,17 @@ with tab1:
             s, e = sprint_date_ranges[i]
             tickvals.append(s + (e - s) / 2)
             ticktext.append(f'Спринт {i}')
+        # constraintext='none' — критично: без него Plotly молча скрывает
+        # подписи вида «Растянута (Сплиттинг)», если полоса на графике
+        # оказалась уже текста (например, при уменьшенном окне браузера).
+        # cliponaxis=False разрешает тексту выходить за пределы полосы.
+        fig.update_traces(
+            textposition='inside',
+            insidetextanchor='middle',
+            constraintext='none',
+            cliponaxis=False,
+            textfont=dict(size=10, color='#ffffff'),
+        )
         fig.update_layout(
             margin=dict(l=10, r=10, t=60, b=40),
             uirevision='constant',
@@ -886,6 +1024,7 @@ with tab1:
         'sp_capacity': 'Не хватает SP команды',
         'role_capacity': 'Дефицит специалистов',
         'no_specialist': 'Нет специалистов в штате',
+        'no_1c_specialist': 'Нет специалистов 1С',
         'bad_estimate': 'Некорректная смета',
         'bad_team': 'Не указана команда',
         'dependency_cycle': 'Цикл зависимостей',
@@ -1055,6 +1194,10 @@ with tab3:
 def _alert_kind(alert_type: str) -> str:
     """Нормализует тип алерта, независимо от старого emoji-префикса."""
     value = str(alert_type or '').lower()
+    # 1С-алерты проверяем ДО общей проверки «структурный дефицит» —
+    # иначе они растворятся в общей категории 'brown'.
+    if '1с' in value and 'структурный' in value:
+        return 'cyan'
     if 'срыв' in value or 'ошибка' in value:
         return 'red'
     if 'сдвиг' in value:
@@ -1203,10 +1346,10 @@ with tab5:
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.error(f'Срывы: {counts["red"]}')
-    c2.warning(f'Сдвиги: {counts["yellow"]}')
-    c3.info(f'Дефициты: {counts["orange"]}')
-    c4.success(f'Парттайм: {counts["purple"]}')
-    c5.error(f'Стр. дефицит: {counts["brown"]}')
+    c2.error(f'Стр. дефицит: {counts["brown"]}')
+    c3.warning(f'Дефициты: {counts["orange"]}')
+    c4.warning(f'Сдвиги: {counts["yellow"]}')
+    c5.info(f'Парттайм: {counts["purple"]}')
 
     st.divider()
 
