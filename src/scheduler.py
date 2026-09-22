@@ -585,10 +585,16 @@ class SmartScheduler:
         summary.columns = columns
         return summary.sort_values('Часов передано', ascending=False)
 
-    def run_smart_planning(self, fact_sprint_done=None, current_time_sprint=0, baseline_schedule=None, forbidden_donors=None):
+    def run_smart_planning(self, fact_sprint_done=None, current_time_sprint=0,
+                            baseline_schedule=None, forbidden_donors=None,
+                            forced_schedule=None):
         fact_sprint_done = fact_sprint_done or {}
         forbidden_donors = forbidden_donors or set()
         current_time_sprint = max(0, min(6, int(current_time_sprint)))
+        # Принудительная постановка задач вне плана: {task_id: {'sprints': [...], 'comment': '...'}}.
+        # Такие задачи ставятся в sprint_schedule напрямую, SP и ЧЧ не списываются,
+        # зависимости не проверяются.
+        forced_schedule = forced_schedule or {}
 
         task_status = {}
         unknown_status_ids = set()
@@ -671,6 +677,48 @@ class SmartScheduler:
                 add_log(1, row, 'Отменена', 'Задача отменена заказчиком.', 'canceled')
             elif task_status.get(t_id) == 'NotTaken':
                 add_log(1, row, 'Не взята в квартал', 'Задача не будет взята в текущий квартал.', 'not_taken')
+
+        # ============================================================
+        # ПРИНУДИТЕЛЬНЫЕ ЗАДАЧИ (вне плана)
+        # ============================================================
+        # Пользователь может принудительно поставить любую задачу на любой
+        # спринт (или несколько). SP и ЧЧ из пулов команды НЕ вычитаются,
+        # зависимости не проверяются, запреты доноров не учитываются.
+        for t_id, entry in forced_schedule.items():
+            row = task_rows.get(t_id)
+            if row is None:
+                continue
+            sprints = entry.get('sprints', []) if isinstance(entry, dict) else list(entry or [])
+            sprints = sorted({int(s) for s in sprints if 1 <= int(s) <= 6})
+            if not sprints:
+                continue
+
+            team = row['team_id']
+            sp_needed = float(row['estimation_sp'])
+            initiative = row['Номер инициативы']
+
+            reserved_sp.add(t_id)
+            task_status[t_id] = 'Done'
+            sprint_when_done[t_id] = max(sprints)
+
+            for s in sprints:
+                sprint_schedule[s].append({
+                    'task_id': t_id,
+                    'initiative': initiative,
+                    'team': team,
+                    'sp': 0.0,
+                    'task_sp': sp_needed,
+                    'status': 'Принудительно (вне плана)',
+                    'burned_hh': 0.0,
+                    'summary': row.get('summary', ''),
+                    'rung': row.get('rung', 0),
+                })
+
+            comment = entry.get('comment', '') if isinstance(entry, dict) else ''
+            reason = f'Принудительно поставлена на спринты: {", ".join(map(str, sprints))}'
+            if comment:
+                reason += f' ({comment})'
+            add_log(sprints[0], row, 'Включена в план', reason, 'forced')
 
         for sprint in self.SPRINTS:
             sp_pool = {k: max(0, float(v)) for k, v in self.team_sp_capacity.items()}
@@ -965,14 +1013,20 @@ class SmartScheduler:
                         sprint_deficits[sprint][role] += deficit
 
                 if deficit_roles:
-                    total_available = 0.0
-                    for role, needed in req_hours.items():
-                        available = temp.get(team, {}).get(role, 0.0)
-                        total_available += min(max(0.0, float(needed)), max(0.0, available))
-                    if total_available <= 1e-9:
-                        add_log(sprint, row, 'Перенос', f"Глобальный дефицит специалистов: {', '.join(deficit_roles)}",
-                                'role_capacity')
-                        continue
+                    # СТРОГИЙ РЕЖИМ: не начинаем задачу, если хотя бы одна
+                    # роль не покрыта полностью. Раньше здесь был сплиттинг —
+                    # задача выполняла часть часов и растягивалась на спринты.
+                    # Это тратило ресурсы, но не давало результата: заказчик
+                    # не получал ничего цельного, а «голодная» роль висела
+                    # до конца квартала. Теперь задача ждёт следующего спринта
+                    # — там состав может быть свободнее (другие задачи уже
+                    # завершились, освободили ЧЧ).
+                    add_log(
+                        sprint, row, 'Перенос',
+                        f"Нет полного покрытия ролей: {', '.join(sorted(deficit_roles))}",
+                        'incomplete_coverage',
+                    )
+                    continue
 
                 team_hours_pool = temp
                 explain_logs.extend(transfers)
@@ -1063,6 +1117,40 @@ class SmartScheduler:
                 continue
             alerts.append({'type': '🔴 КРИТИЧЕСКИЙ (Срыв инициативы)', 'task_id': t_id,
                            'initiative': row['Номер инициативы'], 'description': f"Задача {t_id} не завершена за 6 спринтов."})
+
+        # 🟤 НЕПОЛНОЕ ПОКРЫТИЕ РОЛЕЙ — задачи, которые откладывались, потому
+        # что хотя бы одна роль не обеспечена полностью. Планировщик больше
+        # не начинает такие задачи, чтобы не тратить ресурсы впустую.
+        _coverage_issues = defaultdict(set)
+        for log in explain_logs:
+            if log.get('reason_code') == 'incomplete_coverage':
+                reason = str(log.get('reason', ''))
+                roles_part = reason.replace('Нет полного покрытия ролей: ', '')
+                for role in roles_part.split(', '):
+                    if role.strip():
+                        _coverage_issues[log['task_id']].add(role.strip())
+
+        for t_id, roles in _coverage_issues.items():
+            if task_status.get(t_id) in {'Done', 'Canceled', 'NotTaken'}:
+                continue
+            row = task_rows.get(t_id)
+            if row is None:
+                continue
+            alerts.append({
+                'type': '🟤 НЕПОЛНОЕ ПОКРЫТИЕ РОЛЕЙ',
+                'task_id': t_id,
+                'initiative': row.get('Номер инициативы', 'Без инициативы'),
+                'description': (
+                    f"Задача {t_id} не запланирована: по ролям "
+                    f"{', '.join(sorted(roles))} нет полного покрытия. "
+                    f"Планировщик не начинает задачу, если хотя бы одна роль "
+                    f"не обеспечена целиком — иначе ресурсы тратятся, а "
+                    f"результат не достигается. Что можно сделать: снять "
+                    f"запрет перевода в «Управление данными → Переводы», "
+                    f"добавить инженера с нужной ролью, расширить состав "
+                    f"доноров или отменить задачу на текущий квартал."
+                ),
+            })
 
         blocked_by_map = defaultdict(set)
         for log in explain_logs:
