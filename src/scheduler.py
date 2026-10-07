@@ -14,6 +14,23 @@ LOG_COLUMNS = [
     'donor_team', 'recipient_team', 'role', 'hours', 'donor_engineer'
 ]
 
+# Роли 1С-направления. В предоставленном датасете инженеров с этими ролями
+# нет, поэтому часы в смете по ним всегда «повисают» — задача не может быть
+# выполнена по этим ролям.
+#
+# Флаг ignore_1c_roles управляет поведением:
+#   True  (по умолчанию) — 1С-роли просто игнорируются, задача планируется
+#                          по остальным ролям (старое поведение);
+#   False — задача с любой 1С-ролью вообще не берётся в план и попадает
+#           в «Не поместились в квартал» с общей категорией
+#           «Нет специалистов в штате» (reason_code = 'no_specialist').
+_1C_ROLE_NAMES = {
+    'Аналитик 1С',
+    'Разработчик 1С',
+    'Архитектор 1С',
+    'Специалист поддержки 1С',
+}
+
 
 def normalize_role_name(role) -> str:
     """Нормализует роль; пропуски возвращаются как пустая строка."""
@@ -51,7 +68,9 @@ class SmartScheduler:
 
     def __init__(self, data_path: str = None, *, tasks_df=None, estimates_df=None,
                  deps_df=None, engineers_df=None, history_df=None,
-                 team_overrides_df=None, sprint_dates=None):
+                 team_overrides_df=None, sprint_dates=None,
+                 ignore_1c_roles: bool = True,
+                 allow_splitting: bool = False):
         """
         sprint_dates: dict[int, tuple[date, date]] — опционально. Если передан,
         больничные/отпуска учитываются поспринтово (инженер выпадает только
@@ -60,6 +79,11 @@ class SmartScheduler:
         (обратная совместимость с прежним поведением).
         """
         self.sprint_dates = sprint_dates
+        self.ignore_1c_roles = bool(ignore_1c_roles)
+        # Разрешить сплиттинг: если True — задача делает доступную часть
+        # работы и переносит остаток. Если False — задача не начинается,
+        # пока хотя бы одна роль не покрыта целиком (строгий режим).
+        self.allow_splitting = bool(allow_splitting)
         provided = [tasks_df, estimates_df, deps_df, engineers_df, history_df]
         if all(df is not None for df in provided):
             self.data_path = data_path
@@ -157,6 +181,13 @@ class SmartScheduler:
         self.invalid_task_ids = set()
         self.missing_task_team_ids = set()
         self.bad_estimate_task_ids = set()
+
+        # Задачи, в смете которых есть роли 1С. Ключ — task_id,
+        # значение — {role: hours}. Используется в проходе 1: если
+        # пользователь выключил ignore_1c_roles, такая задача снимается
+        # с плана целиком с reason_code = 'no_specialist' и попадает
+        # в общую категорию «Нет специалистов в штате».
+        self.tasks_with_1c_roles = defaultdict(dict)
 
         required = {'task_id', 'team_id', 'status', 'rung', 'estimation_sp', 'Номер инициативы'}
         missing = sorted(required - set(self.raw_tasks.columns))
@@ -478,6 +509,20 @@ class SmartScheduler:
                         continue
                     # Всегда пишем в raw-версию
                     self.task_estimates_raw[clean_id][norm_r] = self.task_estimates_raw[clean_id].get(norm_r, 0.0) + float(val)
+                    # 1С-роли всегда отслеживаем отдельно: даже если их
+                    # игнорируем в плане, пользователь должен иметь
+                    # возможность увидеть явный алерт.
+                    if norm_r in _1C_ROLE_NAMES:
+                        self.tasks_with_1c_roles[clean_id][norm_r] = (
+                            self.tasks_with_1c_roles[clean_id].get(norm_r, 0.0) + float(val)
+                        )
+                        if self.ignore_1c_roles:
+                            continue  # тихий режим — не считаем и не алертим
+                        self._warn(
+                            f"{clean_id}: задача требует 1С-специалиста «{norm_r}» "
+                            f"({val:g} ЧЧ), но в компании таких сотрудников нет."
+                        )
+                        continue
                     # В планировщик — только если роль есть в штате
                     if norm_r not in self.known_roles:
                         self._warn(f"{clean_id}: роль «{role_name}» отсутствует среди сотрудников; её часы не участвуют в автоматическом планировании.")
@@ -545,10 +590,16 @@ class SmartScheduler:
         summary.columns = columns
         return summary.sort_values('Часов передано', ascending=False)
 
-    def run_smart_planning(self, fact_sprint_done=None, current_time_sprint=0, baseline_schedule=None, forbidden_donors=None):
+    def run_smart_planning(self, fact_sprint_done=None, current_time_sprint=0,
+                            baseline_schedule=None, forbidden_donors=None,
+                            forced_schedule=None):
         fact_sprint_done = fact_sprint_done or {}
         forbidden_donors = forbidden_donors or set()
         current_time_sprint = max(0, min(6, int(current_time_sprint)))
+        # Принудительная постановка задач вне плана: {task_id: {'sprints': [...], 'comment': '...'}}.
+        # Такие задачи ставятся в sprint_schedule напрямую, SP и ЧЧ не списываются,
+        # зависимости не проверяются.
+        forced_schedule = forced_schedule or {}
 
         task_status = {}
         unknown_status_ids = set()
@@ -631,6 +682,48 @@ class SmartScheduler:
                 add_log(1, row, 'Отменена', 'Задача отменена заказчиком.', 'canceled')
             elif task_status.get(t_id) == 'NotTaken':
                 add_log(1, row, 'Не взята в квартал', 'Задача не будет взята в текущий квартал.', 'not_taken')
+
+        # ============================================================
+        # ПРИНУДИТЕЛЬНЫЕ ЗАДАЧИ (вне плана)
+        # ============================================================
+        # Пользователь может принудительно поставить любую задачу на любой
+        # спринт (или несколько). SP и ЧЧ из пулов команды НЕ вычитаются,
+        # зависимости не проверяются, запреты доноров не учитываются.
+        for t_id, entry in forced_schedule.items():
+            row = task_rows.get(t_id)
+            if row is None:
+                continue
+            sprints = entry.get('sprints', []) if isinstance(entry, dict) else list(entry or [])
+            sprints = sorted({int(s) for s in sprints if 1 <= int(s) <= 6})
+            if not sprints:
+                continue
+
+            team = row['team_id']
+            sp_needed = float(row['estimation_sp'])
+            initiative = row['Номер инициативы']
+
+            reserved_sp.add(t_id)
+            task_status[t_id] = 'Done'
+            sprint_when_done[t_id] = max(sprints)
+
+            for s in sprints:
+                sprint_schedule[s].append({
+                    'task_id': t_id,
+                    'initiative': initiative,
+                    'team': team,
+                    'sp': 0.0,
+                    'task_sp': sp_needed,
+                    'status': 'Принудительно (вне плана)',
+                    'burned_hh': 0.0,
+                    'summary': row.get('summary', ''),
+                    'rung': row.get('rung', 0),
+                })
+
+            comment = entry.get('comment', '') if isinstance(entry, dict) else ''
+            reason = f'Принудительно поставлена на спринты: {", ".join(map(str, sprints))}'
+            if comment:
+                reason += f' ({comment})'
+            add_log(sprints[0], row, 'Включена в план', reason, 'forced')
 
         for sprint in self.SPRINTS:
             sp_pool = {k: max(0, float(v)) for k, v in self.team_sp_capacity.items()}
@@ -769,6 +862,19 @@ class SmartScheduler:
                 if task_status.get(t_id) in {'Done', 'Canceled', 'NotTaken'}:
                     continue
                 if t_id in self.invalid_task_ids:
+                    continue
+                # 1С-задачи: если пользователь выключил режим «игнорировать
+                # 1С-роли», задачи с любой 1С-ролью в смете вообще не берутся
+                # в план. Используем общий reason_code 'no_specialist', чтобы
+                # в UI это попадало в ту же категорию, что и остальные задачи
+                # с отсутствующими ролями — «Нет специалистов в штате».
+                if not self.ignore_1c_roles and t_id in self.tasks_with_1c_roles:
+                    roles_str = ', '.join(sorted(self.tasks_with_1c_roles[t_id].keys()))
+                    add_log(
+                        sprint, row, 'Перенос',
+                        f'Нет специалистов для ролей: {roles_str}',
+                        'no_specialist',
+                    )
                     continue
                 if sprint < task_start_sprint:
                     # Задача не может стартовать раньше указанного спринта.
@@ -912,13 +1018,36 @@ class SmartScheduler:
                         sprint_deficits[sprint][role] += deficit
 
                 if deficit_roles:
+                    if not self.allow_splitting:
+                        # СТРОГИЙ РЕЖИМ (по умолчанию): задача не начинается,
+                        # если хотя бы одна роль не покрыта полностью. Она
+                        # ждёт следующего спринта, где состав может быть
+                        # свободнее (другие задачи уже завершились,
+                        # освободили ЧЧ).
+                        add_log(
+                            sprint, row, 'Перенос',
+                            f"Нет полного покрытия ролей: {', '.join(sorted(deficit_roles))}",
+                            'incomplete_coverage',
+                        )
+                        continue
+
+                    # РЕЖИМ СПЛИТТИНГА: задача выполняется частично, остаток
+                    # переносится на следующий спринт. Проверяем, что вообще
+                    # есть хоть какие-то доступные часы — иначе задача не
+                    # начнётся и уйдёт на следующий спринт как role_capacity.
                     total_available = 0.0
                     for role, needed in req_hours.items():
                         available = temp.get(team, {}).get(role, 0.0)
-                        total_available += min(max(0.0, float(needed)), max(0.0, available))
+                        total_available += min(
+                            max(0.0, float(needed)),
+                            max(0.0, available),
+                        )
                     if total_available <= 1e-9:
-                        add_log(sprint, row, 'Перенос', f"Глобальный дефицит специалистов: {', '.join(deficit_roles)}",
-                                'role_capacity')
+                        add_log(
+                            sprint, row, 'Перенос',
+                            f"Глобальный дефицит специалистов: {', '.join(sorted(deficit_roles))}",
+                            'role_capacity',
+                        )
                         continue
 
                 team_hours_pool = temp
@@ -1010,6 +1139,40 @@ class SmartScheduler:
                 continue
             alerts.append({'type': '🔴 КРИТИЧЕСКИЙ (Срыв инициативы)', 'task_id': t_id,
                            'initiative': row['Номер инициативы'], 'description': f"Задача {t_id} не завершена за 6 спринтов."})
+
+        # 🟤 НЕПОЛНОЕ ПОКРЫТИЕ РОЛЕЙ — задачи, которые откладывались, потому
+        # что хотя бы одна роль не обеспечена полностью. Планировщик больше
+        # не начинает такие задачи, чтобы не тратить ресурсы впустую.
+        _coverage_issues = defaultdict(set)
+        for log in explain_logs:
+            if log.get('reason_code') == 'incomplete_coverage':
+                reason = str(log.get('reason', ''))
+                roles_part = reason.replace('Нет полного покрытия ролей: ', '')
+                for role in roles_part.split(', '):
+                    if role.strip():
+                        _coverage_issues[log['task_id']].add(role.strip())
+
+        for t_id, roles in _coverage_issues.items():
+            if task_status.get(t_id) in {'Done', 'Canceled', 'NotTaken'}:
+                continue
+            row = task_rows.get(t_id)
+            if row is None:
+                continue
+            alerts.append({
+                'type': '🟤 НЕПОЛНОЕ ПОКРЫТИЕ РОЛЕЙ',
+                'task_id': t_id,
+                'initiative': row.get('Номер инициативы', 'Без инициативы'),
+                'description': (
+                    f"Задача {t_id} не запланирована: по ролям "
+                    f"{', '.join(sorted(roles))} нет полного покрытия. "
+                    f"Планировщик не начинает задачу, если хотя бы одна роль "
+                    f"не обеспечена целиком — иначе ресурсы тратятся, а "
+                    f"результат не достигается. Что можно сделать: снять "
+                    f"запрет перевода в «Управление данными → Переводы», "
+                    f"добавить инженера с нужной ролью, расширить состав "
+                    f"доноров или отменить задачу на текущий квартал."
+                ),
+            })
 
         blocked_by_map = defaultdict(set)
         for log in explain_logs:
@@ -1112,6 +1275,12 @@ class SmartScheduler:
                     if norm_r in {'', 'ИТОГО'}:
                         continue
                     if norm_r in self.known_roles:
+                        continue
+                    # 1С-роли уже обработаны в проходе 1 — там задача
+                    # снимается с плана целиком с reason_code = 'no_specialist'.
+                    # Здесь пропускаем их, чтобы не было двойного сообщения
+                    # об одной и той же проблеме.
+                    if norm_r in _1C_ROLE_NAMES:
                         continue
                     val = pd.to_numeric(source_row[t_id], errors='coerce')
                     if pd.isna(val) or val <= 0:

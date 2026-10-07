@@ -87,8 +87,11 @@ def fa_text(icon: str, text: str) -> str:
 
 
 def render_unscheduled_table(rows: list[dict]) -> str:
-    """Рендерит таблицу с Font Awesome иконками в колонке «Категория»."""
-    headers = ['Задача', 'Rung', 'Инициатива', 'Команда', 'Категория', 'Причина']
+    """Рендерит таблицу с Font Awesome иконками в колонке «Категория».
+    Колонка «Прогноз» показывает, в каком спринте задача завершится
+    (для тех, что в плане) или что не завершится в квартале."""
+    headers = ['Задача', 'Rung', 'Инициатива', 'Команда',
+               'Категория', 'Прогноз', 'Причина']
     parts = ['<div class="fa-table-wrap"><table class="fa-table"><thead><tr>']
     parts.extend(f'<th>{escape(h)}</th>' for h in headers)
     parts.append('</tr></thead><tbody>')
@@ -98,6 +101,7 @@ def render_unscheduled_table(rows: list[dict]) -> str:
         'Не хватает SP команды': 'fa-chart-column',
         'Дефицит специалистов': 'fa-user-xmark',
         'Нет специалистов в штате': 'fa-user-slash',
+        'Неполное покрытие ролей': 'fa-circle-half-stroke',
         'Некорректная смета': 'fa-circle-exclamation',
         'Не указана команда': 'fa-people-group',
         'Цикл зависимостей': 'fa-arrows-rotate',
@@ -111,10 +115,27 @@ def render_unscheduled_table(rows: list[dict]) -> str:
     for row in rows:
         category = str(row.get('Категория', 'Другое'))
         icon = fa_icon(icon_map.get(category, 'fa-circle-question'))
+        forecast = str(row.get('Прогноз', ''))
+        # Подсветка прогноза: зелёный — задача завершится до конца квартала,
+        # красный — не завершится или впритык к последнему спринту.
+        if forecast.startswith('❌') or forecast.startswith('⚠️'):
+            forecast_html = (
+                f'<span style="color:#e74c3c;font-weight:600;">'
+                f'{escape(forecast)}</span>'
+            )
+        elif forecast.startswith('✅'):
+            forecast_html = (
+                f'<span style="color:#27ae60;">{escape(forecast)}</span>'
+            )
+        else:
+            forecast_html = escape(forecast)
+
         parts.append('<tr>')
         for h in headers:
             if h == 'Категория':
                 parts.append(f'<td>{icon}{escape(category)}</td>')
+            elif h == 'Прогноз':
+                parts.append(f'<td>{forecast_html}</td>')
             else:
                 parts.append(f'<td>{escape(str(row.get(h, "")))}</td>')
         parts.append('</tr>')
@@ -142,6 +163,36 @@ h3, h4, h5 { margin-top: 0.6rem; }
 .fa-table th, .fa-table td { padding: 8px 10px; border-bottom: 1px solid rgba(128,128,128,.2); text-align: left; vertical-align: top; }
 .fa-table th { font-weight: 600; }
 .fa-table .fa-ui-icon { margin-right: 0.35em; }
+
+/* ─── Скролл вкладок ─────────────────────────────────────────── */
+/* 7 длинных вкладок («Управление данными», «Журнал событий» и др.)
+   не влезают в узкое окно. Разрешаем горизонтальный скролл вместо
+   обрезания и запрещаем flex-перенос на вторую строку. */
+.stTabs [data-baseweb="tab-list"] {
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    flex-wrap: nowrap !important;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(128,128,128,.45) transparent;
+}
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar {
+    height: 6px;
+}
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar-track {
+    background: transparent;
+}
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar-thumb {
+    background: rgba(128,128,128,.45);
+    border-radius: 3px;
+}
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar-thumb:hover {
+    background: rgba(128,128,128,.7);
+}
+.stTabs [data-baseweb="tab"] {
+    flex-shrink: 0 !important;
+    white-space: nowrap;
+}
+/* ────────────────────────────────────────────────────────────── */
 </style>
 ''',
     unsafe_allow_html=True,
@@ -194,6 +245,31 @@ if not st.session_state.get('_runtime_loaded'):
     st.session_state['_stored_current_sprint'] = _stored_runtime.get('current_time_sprint')
     st.session_state['_stored_fact'] = _stored_runtime.get('fact_sprint_done', {}) or {}
     st.session_state['_stored_quarter_start_iso'] = _stored_runtime.get('quarter_start_value')
+    # Флаг «игнорировать 1С-роли» тоже персистим между сессиями. По умолчанию True
+    # (старое поведение — 1С-роли игнорируются, задачи планируются по остальным).
+    st.session_state['_stored_ignore_1c_roles'] = bool(
+        _stored_runtime.get('ignore_1c_roles', True)
+    )
+    st.session_state['_ignore_1c_roles_value'] = st.session_state['_stored_ignore_1c_roles']
+    # Запрещённые переводы: список пар [donor_team, role]. Хранится в
+    # runtime_state — переживает F5 и перезапуск. Раньше был эфемерным
+    # session_state и обнулялся при каждой перезагрузке.
+    _stored_forbidden_raw = _stored_runtime.get('forbidden_donors', []) or []
+    st.session_state['_stored_forbidden_donors'] = _stored_forbidden_raw
+    st.session_state['_forbidden_donors_value'] = {
+        (str(pair[0]), str(pair[1]))
+        for pair in _stored_forbidden_raw
+        if isinstance(pair, (list, tuple)) and len(pair) >= 2
+    }
+    # Принудительные задачи вне плана: {task_id: {'sprints': [...], 'comment': '...'}}.
+    st.session_state['_forced_schedule_value'] = dict(
+        _stored_runtime.get('forced_schedule', {}) or {}
+    )
+    # Режим сплиттинга: по умолчанию выключен (строгий режим —
+    # задача не начинается без полного покрытия ролей).
+    st.session_state['_allow_splitting_value'] = bool(
+        _stored_runtime.get('allow_splitting', False)
+    )
     st.session_state['_runtime_loaded'] = True
 st.session_state['storage'] = storage
 
@@ -202,6 +278,30 @@ user = auth.get_current_user()
 if not st.session_state.get('_session_logged'):
     storage.log_session(user, 'login')
     st.session_state['_session_logged'] = True
+
+# ---- Панель входа (сайдбар) ----
+st.sidebar.markdown('---')
+st.sidebar.markdown(f"### {fa_text('fa-user-lock', 'Аккаунт')}", unsafe_allow_html=True)
+st.sidebar.caption(f'Вы вошли как **{user.name}** (роль: {user.role})')
+
+with st.sidebar.expander('Сменить роль'):
+    account_ids = list(auth.ACCOUNTS.keys())
+    default_idx = account_ids.index(user.id) if user.id in account_ids else 0
+    picked_id = st.selectbox(
+        'Пользователь:',
+        account_ids,
+        index=default_idx,
+        key='login_role_pick',
+    )
+    pwd = st.text_input('Пароль:', type='password', key='login_pwd')
+    if st.button('Войти', key='login_btn'):
+        new_user = auth.try_login(picked_id, pwd)
+        if new_user is not None:
+            auth.set_current_user(new_user)
+            storage.log_session(new_user, 'role_switch', comment=f'Переключение на {picked_id}')
+            st.rerun()
+        else:
+            st.error('Неверный пароль.')
 
 # ---- Загрузка/восстановление состояния ----
 if 'working_dfs' not in st.session_state:
@@ -269,38 +369,151 @@ def sprint_label(i: int) -> str:
 
 sprint_dates_for_sched = {i: sprint_date_ranges[i] for i in range(1, 7)}
 
+# ===== НАСТРОЙКИ ПЛАНИРОВАНИЯ =====
+st.sidebar.markdown('---')
+st.sidebar.markdown(f"### {fa_text('fa-user-shield', 'Настройки планирования')}", unsafe_allow_html=True)
+
+# Подтверждённое (persisted) значение — источник истины для планировщика.
+_persisted_1c = bool(st.session_state.get('_ignore_1c_roles_value', True))
+
+# Колбэки смены режима. Выполняются ДО инстанцирования виджета на
+# следующем rerun, поэтому присвоение session_state с ключом виджета
+# безопасно (иначе Streamlit бросил бы "cannot be modified after widget
+# is instantiated").
+def _confirm_1c_toggle():
+    new_val = bool(st.session_state.get('ignore_1c_roles_cb', True))
+    st.session_state['_ignore_1c_roles_value'] = new_val
+    st.session_state['_stored_ignore_1c_roles'] = new_val
+
+def _cancel_1c_toggle():
+    # Возвращаем чекбокс к подтверждённому значению.
+    st.session_state['ignore_1c_roles_cb'] = st.session_state['_ignore_1c_roles_value']
+
+# Гарантируем, что ключ виджета есть в session_state до его создания.
+# Это единственный способ подсунуть виджету persisted-значение без
+# конфликта с параметром value= (Streamlit запрещает передавать оба
+# одновременно и ругается предупреждением).
+if 'ignore_1c_roles_cb' not in st.session_state:
+    st.session_state['ignore_1c_roles_cb'] = _persisted_1c
+
+_cb_1c_value = st.sidebar.checkbox(
+    'Игнорировать 1С-роли при планировании',
+    key='ignore_1c_roles_cb',
+    # value= НЕ передаём: значение уже сидит в session_state.
+    help=(
+        'В датасете нет ни одного 1С-инженера, поэтому задачи с 1С-ролями '
+        'нельзя выполнить полностью.\n\n'
+        '• Галочка ВКЛючена: 1С-роли игнорируются, задача планируется по '
+        'остальным ролям.\n'
+        '• Галочка СНЯТА: задача с любой 1С-ролью вообще не берётся в план. '
+        'Она попадёт в раздел «Не поместились в квартал» с категорией '
+        '«Нет специалистов в штате» и причиной вида «Нет специалистов '
+        'для ролей: Аналитик 1С».'
+    ),
+)
+
+# Если текущее состояние чекбокса расходится с подтверждённым — показываем
+# блок подтверждения. Планировщик до подтверждения использует прежнее
+# значение, чтобы случайный клик не перекроил план.
+if _cb_1c_value != _persisted_1c:
+    _mode_now = 'игнорировать 1С-роли' if _persisted_1c else 'снимать 1С-задачи с плана'
+    _mode_new = 'игнорировать 1С-роли' if _cb_1c_value else 'снимать 1С-задачи с плана'
+    st.sidebar.warning(
+        f'⚠️ **Подтверждение смены режима**\n\n'
+        f'Сейчас: {_mode_now}.\n\n'
+        f'Станет: **{_mode_new}**.\n\n'
+        f'План будет пересчитан только после подтверждения.'
+    )
+    _col_ok, _col_cancel = st.sidebar.columns(2)
+    _col_ok.button(
+        '✅ Подтвердить',
+        key='confirm_1c_toggle',
+        on_click=_confirm_1c_toggle,
+        use_container_width=True,
+        type='primary',
+    )
+    _col_cancel.button(
+        '↩️ Отмена',
+        key='cancel_1c_toggle',
+        on_click=_cancel_1c_toggle,
+        use_container_width=True,
+    )
+    # До подтверждения — прежний режим.
+    ignore_1c_roles = _persisted_1c
+else:
+    ignore_1c_roles = _persisted_1c
+
+if ignore_1c_roles:
+    st.sidebar.caption('Режим: 1С-роли **игнорируются**, задачи планируются.')
+else:
+    st.sidebar.caption('Режим: задачи с 1С-ролями **снимаются с плана**.')
+
+# --- Режим сплиттинга ---
+allow_splitting = st.sidebar.checkbox(
+    'Разрешить сплиттинг больших задач',
+    value=bool(st.session_state.get('_allow_splitting_value', False)),
+    key='allow_splitting_cb',
+    help=(
+        'Управляет поведением, когда по одной или нескольким ролям не хватает '
+        'часов даже после попытки привлечь доноров.\n\n'
+        '• Галочка СНЯТА (по умолчанию): строгий режим. Задача не начинается, '
+        'пока хотя бы одна роль не покрыта целиком. Она ждёт следующего '
+        'спринта — там состав может быть свободнее.\n'
+        '• Галочка ВКЛючена: сплиттинг. Задача делает доступную часть работы '
+        'в этом спринте, остаток переносится на следующий. SP списываются '
+        'один раз — при первом включении задачи в план.'
+    ),
+)
+st.session_state['_allow_splitting_value'] = bool(allow_splitting)
+if allow_splitting:
+    st.sidebar.caption('Режим: сплиттинг **разрешён**.')
+else:
+    st.sidebar.caption('Режим: **строгий** — задача целиком или ждёт.')
+
 # ===== ПЛАНИРОВЩИКИ =====
 working_dfs = st.session_state['working_dfs']
 committed_dfs = st.session_state['committed_dfs']
 
-sched = SmartScheduler(**working_dfs, sprint_dates=sprint_dates_for_sched)
+sched = SmartScheduler(
+    **working_dfs,
+    sprint_dates=sprint_dates_for_sched,
+    ignore_1c_roles=ignore_1c_roles,
+    allow_splitting=allow_splitting,
+)
 analytics = StarMapAnalytics(engineers_df=working_dfs['engineers_df'])
-baseline_sched = SmartScheduler(**committed_dfs, sprint_dates=sprint_dates_for_sched)
+baseline_sched = SmartScheduler(
+    **committed_dfs,
+    sprint_dates=sprint_dates_for_sched,
+    ignore_1c_roles=ignore_1c_roles,
+    allow_splitting=allow_splitting,
+)
 b_schedule, b_statuses, b_logs, b_alerts, b_kpis, b_burned = baseline_sched.run_smart_planning()
 
 bf_df = analytics.get_bus_factor_and_training()
 roles_df = analytics.get_critical_roles_shortage()
 
-# ===== УПРАВЛЯЕМАЯ РЕОРГАНИЗАЦИЯ =====
+# ===== УПРАВЛЯЕМАЯ РЕОРГАНИЗАЦИЯ (ссылка на вкладку) =====
 st.sidebar.markdown('---')
 st.sidebar.markdown(f"### {fa_text('fa-screwdriver-wrench', 'Управление реорганизацией')}", unsafe_allow_html=True)
-transfer_summary = sched.get_transfer_summary(b_logs)
-forbidden_donors = set()
-if not transfer_summary.empty:
-    st.sidebar.caption(
-        'Алгоритм показывает автоматические переводы из baseline. '
-        'Вы можете запретить конкретную связку «донор + роль» и пересчитать план. '
-        'Актуальный список переводов — ниже, после пересчёта.'
+
+# Запрещённые переводы — источник истины из runtime_state. Пользователь
+# управляет ими через «Управление данными → 🔄 Переводы», здесь только
+# статус и подсказка. Раньше чекбоксы были прямо в сайдбаре, но они не
+# персистили: после F5 список обнулялся и план пересчитывался без запретов.
+forbidden_donors = set(st.session_state.get('_forbidden_donors_value', set()))
+
+st.sidebar.caption(
+    'Полный список переводов, запрет и восстановление — '
+    'во вкладке **«Управление данными → 🔄 Переводы»** '
+    '(вкладки прокручиваются по горизонтали колёсиком).'
+)
+if forbidden_donors:
+    st.sidebar.warning(
+        f'🚫 Запрещено: **{len(forbidden_donors)}** перевод(ов). '
+        f'План пересчитан с учётом запретов.'
     )
-    ts = transfer_summary.copy()
-    ts['_key'] = ts['Команда-донор'].astype(str) + ' отдаёт «' + ts['Роль'].astype(str) + '»'
-    options = ts.drop_duplicates('_key')['_key'].tolist()
-    picked = st.sidebar.multiselect('Запретить перевод от команды-донора:', options=options)
-    for value in picked:
-        donor, role_part = value.split(' отдаёт «', 1)
-        forbidden_donors.add((donor, role_part.rstrip('»')))
 else:
-    st.sidebar.caption('В baseline-плане переводов между командами не потребовалось.')
+    st.sidebar.caption('Активных запретов нет.')
 
 # ===== ВЫБОР ТЕКУЩЕГО СПРИНТА =====
 today = date.today()
@@ -473,15 +686,32 @@ if current_time_sprint > 0:
                     fact_sprint_done[tid] = sprint
 
 # ---- Сохраняем runtime-состояние на диск ----
+_forbidden_snapshot = sorted(
+    st.session_state.get('_forbidden_donors_value', set())
+)
+_forced_schedule_now = dict(st.session_state.get('_forced_schedule_value', {}) or {})
+_forced_snapshot = tuple(sorted(
+    (t_id, tuple(entry.get('sprints', []) if isinstance(entry, dict) else []))
+    for t_id, entry in _forced_schedule_now.items()
+))
+
 _current_runtime = {
     'current_time_sprint': current_time_sprint,
     'fact_sprint_done': fact_sprint_done,
     'quarter_start_value': quarter_start.isoformat() if quarter_start else None,
+    'ignore_1c_roles': bool(st.session_state.get('_ignore_1c_roles_value', True)),
+    'forbidden_donors': [list(pair) for pair in _forbidden_snapshot],
+    'forced_schedule': _forced_schedule_now,
+    'allow_splitting': bool(st.session_state.get('_allow_splitting_value', False)),
 }
 _runtime_hash = hash((
     _current_runtime['current_time_sprint'],
     tuple(sorted(_current_runtime['fact_sprint_done'].items())),
     _current_runtime['quarter_start_value'],
+    _current_runtime['ignore_1c_roles'],
+    tuple(_forbidden_snapshot),
+    _forced_snapshot,
+    _current_runtime['allow_splitting'],
 ))
 if st.session_state.get('_last_runtime_hash') != _runtime_hash:
     storage.save_runtime(_current_runtime)
@@ -489,6 +719,9 @@ if st.session_state.get('_last_runtime_hash') != _runtime_hash:
     st.session_state['_stored_current_sprint'] = current_time_sprint
     st.session_state['_stored_fact'] = dict(fact_sprint_done)
     st.session_state['_stored_quarter_start_iso'] = _current_runtime['quarter_start_value']
+    st.session_state['_stored_ignore_1c_roles'] = _current_runtime['ignore_1c_roles']
+    st.session_state['_stored_forbidden_donors'] = _current_runtime['forbidden_donors']
+    st.session_state['_stored_allow_splitting'] = _current_runtime['allow_splitting']
 
 # ===== ВАЛИДАЦИЯ ФАКТИЧЕСКИХ ЗАВИСИМОСТЕЙ =====
 _done_statuses = {'done', 'completed', 'завершена', 'завершено', 'готово', 'выполнена', 'выполнено'}
@@ -541,13 +774,20 @@ if fact_dependency_warnings:
             st.caption(f'• {warning}')
 
 # ===== ПЕРЕСЧЁТ =====
-needs_recompute = current_time_sprint > 0 or bool(forbidden_donors)
+_forced_schedule = dict(st.session_state.get('_forced_schedule_value', {}) or {})
+
+needs_recompute = (
+    current_time_sprint > 0
+    or bool(forbidden_donors)
+    or bool(_forced_schedule)
+)
 if needs_recompute:
     c_schedule, c_statuses, c_logs, c_alerts, c_kpis, c_burned = sched.run_smart_planning(
         fact_sprint_done=fact_sprint_done,
         current_time_sprint=current_time_sprint,
         baseline_schedule=b_schedule,
         forbidden_donors=forbidden_donors,
+        forced_schedule=_forced_schedule,
     )
 else:
     c_schedule, c_statuses, c_logs, c_alerts, c_kpis, c_burned = (
@@ -556,6 +796,34 @@ else:
 
 # ---- Актуальный список переводов после пересчёта ----
 current_transfer_summary = sched.get_transfer_summary(c_logs)
+
+
+def _transfers_detail_from_logs(logs_df):
+    """Возвращает DF с постатейной детализацией переводов. Из логов берём
+    всё, что нужно для вкладки «Переводы»: спринт, задачу, донора, роль,
+    получателя, часы и конкретного инженера-донора."""
+    cols = ['sprint', 'task_id', 'initiative', 'donor_team', 'role',
+            'recipient_team', 'hours', 'donor_engineer']
+    if logs_df is None or logs_df.empty or 'action' not in logs_df.columns:
+        return pd.DataFrame(columns=cols)
+    tr = logs_df[logs_df['action'] == 'Реорганизация (Перевод)'].copy()
+    if tr.empty:
+        return pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in tr.columns:
+            tr[c] = None
+    return tr[cols].reset_index(drop=True)
+
+
+# Контекст для вкладки «Управление данными → 🔄 Переводы».
+# Активные — из c_logs (после применения запретов), baseline — из b_logs
+# (для контекста: что было в исходном плане).
+st.session_state['_transfers_context'] = {
+    'active_summary': current_transfer_summary,
+    'active_detail': _transfers_detail_from_logs(c_logs),
+    'baseline_detail': _transfers_detail_from_logs(b_logs),
+}
+
 with st.sidebar.expander(
     f'Переводы в текущем плане ({len(current_transfer_summary)})',
     expanded=False,
@@ -672,12 +940,15 @@ with tab1:
     for sprint, tasks in c_schedule.items():
         start, end = sprint_date_ranges[sprint]
         for item in tasks:
+            _status = item.get('status', '')
+            _is_forced = _status == 'Принудительно (вне плана)'
             gantt_records.append({
                 'Task': item['task_id'], 'Sprint': sprint_label(sprint), 'Sprint_Num': sprint,
                 'Start': start, 'Finish': end + timedelta(days=1),
                 'Summary': item.get('summary', ''), 'Team': item.get('team', ''),
                 'Initiative': item.get('initiative', 'Без инициативы'), 'Rung': item.get('rung', 0),
-                'Status': item.get('status', ''), 'SP': item.get('sp', 0),
+                'Status': ('📌 ' + _status) if _is_forced else _status,
+                'SP': item.get('sp', 0),
                 'SP задачи': item.get('task_sp', item.get('sp', 0)),
                 'Списано HH': round(float(item.get('burned_hh', 0) or 0), 1),
             })
@@ -694,6 +965,17 @@ with tab1:
             s, e = sprint_date_ranges[i]
             tickvals.append(s + (e - s) / 2)
             ticktext.append(f'Спринт {i}')
+        # constraintext='none' — критично: без него Plotly молча скрывает
+        # подписи вида «Растянута (Сплиттинг)», если полоса на графике
+        # оказалась уже текста (например, при уменьшенном окне браузера).
+        # cliponaxis=False разрешает тексту выходить за пределы полосы.
+        fig.update_traces(
+            textposition='inside',
+            insidetextanchor='middle',
+            constraintext='none',
+            cliponaxis=False,
+            textfont=dict(size=10, color='#ffffff'),
+        )
         fig.update_layout(
             margin=dict(l=10, r=10, t=60, b=40),
             uirevision='constant',
@@ -780,6 +1062,17 @@ with tab1:
                                     pairs.append(f'{d_team} ({d_hours:.0f} ЧЧ)')
                         donor_info = ', '.join(pairs) if pairs else ''
 
+                # Показываем, что по этой роли есть запрещённый донор —
+                # иначе пользователь не понимает, почему задача стала сплитом.
+                if not donor_info and role not in req:
+                    _forbidden = st.session_state.get('_forbidden_donors_value', set())
+                    _blocked_teams = [
+                        team for team, blocked_role in _forbidden
+                        if blocked_role == role
+                    ]
+                    if _blocked_teams:
+                        donor_info = f'🚫 запрещено: {", ".join(sorted(set(_blocked_teams)))}'
+
                 own_details = []
                 for eid in sorted(own_engineers):
                     emp = sched.engineers_df[sched.engineers_df['engineer_id'] == eid]
@@ -862,6 +1155,7 @@ with tab1:
         'sp_capacity': 'Не хватает SP команды',
         'role_capacity': 'Дефицит специалистов',
         'no_specialist': 'Нет специалистов в штате',
+        'incomplete_coverage': 'Неполное покрытие ролей',
         'bad_estimate': 'Некорректная смета',
         'bad_team': 'Не указана команда',
         'dependency_cycle': 'Цикл зависимостей',
@@ -876,6 +1170,28 @@ with tab1:
     for _items in c_schedule.values():
         for _item in _items:
             tasks_in_plan.add(_item['task_id'])
+
+    # Прогнозная дата завершения для каждой задачи в плане: последний
+    # спринт, в котором задача встречается. Если задача растянута на
+    # несколько спринтов — берём максимальный.
+    task_last_sprint = {}
+    for _sprint, _items in c_schedule.items():
+        for _item in _items:
+            _tid = _item['task_id']
+            _prev = task_last_sprint.get(_tid, 0)
+            if _sprint > _prev:
+                task_last_sprint[_tid] = _sprint
+
+    # Прогнозная дата в терминах календаря (для подписи в UI).
+    def _forecast_label(tid):
+        if tid not in task_last_sprint:
+            return '❌ не завершится в квартале'
+        last_sp = task_last_sprint[tid]
+        _, end_date = sprint_date_ranges[last_sp]
+        # Если задача в последнем спринте квартала — помечаем как «впритык».
+        if last_sp == 6:
+            return f'⚠️ Спринт {last_sp} (впритык, до {end_date:%d.%m})'
+        return f'✅ Спринт {last_sp} (до {end_date:%d.%m})'
 
     continuing_rows = []
     not_fit_rows = []
@@ -901,7 +1217,9 @@ with tab1:
             'Задача': tid, 'Rung': row.get('rung', 0),
             'Инициатива': row.get('Номер инициативы', 'Без инициативы'),
             'Команда': row.get('team_id', ''),
-            'Категория': category, 'Причина': reason_text,
+            'Категория': category,
+            'Прогноз': _forecast_label(tid),
+            'Причина': reason_text,
         }
         if tid in tasks_in_plan:
             continuing_rows.append(record)
@@ -979,6 +1297,137 @@ with tab2:
                 use_container_width=True, hide_index=True,
             )
 
+    # ===== ПРОФИЛЬ КОМАНДЫ =====
+    st.markdown('---')
+    st.markdown(f"##### {fa_text('fa-people-group', 'Профиль команды')}", unsafe_allow_html=True)
+    st.caption(
+        'Агрегированная карточка: состав, покрытие ролей, утилизация, '
+        'критичные роли и критичные навыки в одном месте.'
+    )
+
+    _profile_teams = sorted(
+        emp_df['Команда'].dropna().astype(str).unique().tolist()
+    ) if not emp_df.empty else []
+    _profile_teams = [t for t in _profile_teams if t and t.lower() != 'nan']
+
+    if not _profile_teams:
+        st.info('Нет данных по командам.')
+    else:
+        _picked_team = st.selectbox(
+            'Команда:', options=_profile_teams, key='team_profile_pick',
+        )
+
+        # --- Собираем данные по выбранной команде ---
+        _team_emp = emp_df[emp_df['Команда'] == _picked_team].copy()
+        _team_role_engineers = sched.team_role_engineers.get(_picked_team, {})
+        _team_role_hours = sched.team_role_hours.get(_picked_team, {})
+
+        # Критичные роли: 1 сотрудник в команде на эту роль
+        _single_role_mask = (
+            (roles_df['Команда'] == _picked_team)
+            & (roles_df['Кол-во сотрудников'] == 1)
+        ) if not roles_df.empty else None
+        _single_roles = (
+            roles_df[_single_role_mask]['Роль'].tolist()
+            if _single_role_mask is not None else []
+        )
+
+        # Критичные навыки (BF=1) внутри этой команды
+        _bf_local_df = analytics.get_bus_factor_by_team()
+        _team_critical_skills = (
+            _bf_local_df[
+                (_bf_local_df['Команда'] == _picked_team)
+                & (_bf_local_df['Bus Factor команды'] == 1)
+            ] if not _bf_local_df.empty else pd.DataFrame()
+        )
+
+        # Средняя утилизация команды
+        _util_vals = pd.to_numeric(
+            _team_emp['Утилизация (%)'].astype(str).str.rstrip('%'),
+            errors='coerce',
+        ).dropna()
+        _avg_util = float(_util_vals.mean()) if not _util_vals.empty else 0.0
+
+        # --- KPI-карточки ---
+        kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+        kc1.metric('Инженеров', len(_team_emp))
+        kc2.metric('Ролей', _team_emp['Роль'].nunique())
+        kc3.metric(
+            'Ролей с 1 сотрудником',
+            len(_single_roles),
+            delta=None if not _single_roles else '⚠️ критично',
+            delta_color='inverse',
+        )
+        kc4.metric('Критичных навыков (BF=1)', len(_team_critical_skills))
+        kc5.metric('Ср. утилизация', f'{_avg_util:.1f}%')
+
+        # --- Предупреждения по рискам ---
+        if _single_roles:
+            st.warning(
+                '⚠️ **Роли с одним сотрудником.** Уход или отпуск этого '
+                'специалиста остановит задачи, требующие роли: '
+                + ', '.join(f'`{r}`' for r in _single_roles) + '.'
+            )
+        if not _team_critical_skills.empty:
+            _crit_skill_names = _team_critical_skills['Технология / Компетенция'].tolist()
+            st.info(
+                f'🔍 **Критичные навыки в команде ({len(_crit_skill_names)}).** '
+                f'Ими владеет только один инженер команды — риск при уходе: '
+                + ', '.join(f'`{s}`' for s in _crit_skill_names[:5])
+                + ('…' if len(_crit_skill_names) > 5 else '.')
+            )
+        if not _single_roles and _team_critical_skills.empty:
+            st.success('Команда устойчива: критичных ролей и навыков нет.')
+
+        # --- Подробности в expander-ах ---
+        _exp1, _exp2, _exp3 = st.columns(3)
+
+        with _exp1:
+            with st.expander(f'👥 Состав команды ({len(_team_emp)})', expanded=False):
+                _team_emp_view = _team_emp[[
+                    'Инженер', 'Роль', 'Статус', 'Ставка',
+                    'Доступно (ЧЧ/кв)', 'Утилизация (%)',
+                ]].rename(columns={'Инженер': 'Инженер'})
+                st.dataframe(
+                    _team_emp_view, use_container_width=True, hide_index=True,
+                )
+
+        with _exp2:
+            with st.expander(f'🎯 Покрытие ролей ({len(_team_role_hours)})', expanded=False):
+                _role_rows = []
+                for _role in sorted(_team_role_hours.keys()):
+                    _eng_set = _team_role_engineers.get(_role, set())
+                    _role_rows.append({
+                        'Роль': _role,
+                        'Инженеров': len(_eng_set),
+                        'ЧЧ/спринт (сумма)': round(float(_team_role_hours[_role]), 1),
+                        'Критично': '⚠️ да' if _role in _single_roles else '—',
+                    })
+                if _role_rows:
+                    _role_df = pd.DataFrame(_role_rows).sort_values(
+                        by=['Критично', 'Роль'], ascending=[False, True],
+                    )
+                    st.dataframe(_role_df, use_container_width=True, hide_index=True)
+                else:
+                    st.caption('Нет данных по ролям.')
+
+        with _exp3:
+            with st.expander(
+                f'⚠️ Критичные навыки ({len(_team_critical_skills)})',
+                expanded=False,
+            ):
+                if _team_critical_skills.empty:
+                    st.caption('Нет критичных навыков в команде.')
+                else:
+                    st.dataframe(
+                        _team_critical_skills[[
+                            'Технология / Компетенция',
+                            'Bus Factor команды',
+                            'Специалисты в команде',
+                        ]],
+                        use_container_width=True, hide_index=True,
+                    )
+
     st.markdown('---')
     st.markdown('##### Историческая стабильность команд')
     st.dataframe(sched.get_team_reliability(), use_container_width=True, hide_index=True)
@@ -1031,6 +1480,11 @@ with tab3:
 def _alert_kind(alert_type: str) -> str:
     """Нормализует тип алерта, независимо от старого emoji-префикса."""
     value = str(alert_type or '').lower()
+    # Неполное покрытие ролей относим к структурному дефициту: причина
+    # та же — на задачу не хватает людей нужной роли. Но это более
+    # специфичная проверка, поэтому идёт раньше общей.
+    if 'неполное покрытие' in value or 'покрытие ролей' in value:
+        return 'brown'
     if 'срыв' in value or 'ошибка' in value:
         return 'red'
     if 'сдвиг' in value:
@@ -1179,10 +1633,10 @@ with tab5:
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.error(f'Срывы: {counts["red"]}')
-    c2.warning(f'Сдвиги: {counts["yellow"]}')
-    c3.info(f'Дефициты: {counts["orange"]}')
-    c4.success(f'Парттайм: {counts["purple"]}')
-    c5.error(f'Стр. дефицит: {counts["brown"]}')
+    c2.error(f'Стр. дефицит: {counts["brown"]}')
+    c3.warning(f'Дефициты: {counts["orange"]}')
+    c4.warning(f'Сдвиги: {counts["yellow"]}')
+    c5.info(f'Парттайм: {counts["purple"]}')
 
     st.divider()
 
@@ -1203,6 +1657,25 @@ with tab5:
 # ===== УПРАВЛЕНИЕ ДАННЫМИ =====
 with tab_manage:
     if auth.require_permission('edit_data', 'management'):
+        # Контекст для вкладки «📌 Вне плана».
+        _tasks_in_plan = set()
+        for _items in c_schedule.values():
+            for _it in _items:
+                _tasks_in_plan.add(_it['task_id'])
+        st.session_state['_forced_context'] = {
+            'all_task_ids': sorted(sched.tasks['task_id'].astype(str).tolist()),
+            'tasks_in_plan': sorted(_tasks_in_plan),
+            'task_meta': {
+                str(row['task_id']): {
+                    'team': str(row.get('team_id', '') or ''),
+                    'rung': int(row.get('rung', 0) or 0),
+                    'sp': int(row.get('estimation_sp', 0) or 0),
+                    'summary': str(row.get('summary', '') or ''),
+                    'status': str(row.get('status', '') or ''),
+                }
+                for _, row in sched.tasks.iterrows()
+            },
+        }
         data_management.render(storage)
 
 # ===== ЖУРНАЛ СОБЫТИЙ =====

@@ -19,6 +19,29 @@ import re
 from datetime import date, timedelta
 
 
+def _is_blank_id(value) -> bool:
+    """True, если значение пустое: NaN, None, pd.NA, '', 'nan', '<NA>' и т.п.
+
+    Не полагаемся на .astype(str), потому что поведение pandas при
+    преобразовании NaN/None/pd.NA в строку различается между версиями
+    и dtype колонки. Сначала проверяем pd.isna() — это покрывает все
+    числовые/объектные/special NaN-like значения. Потом — строковую
+    нормализацию на случай, если значение уже пришло как текст
+    'nan' / '<NA>' / 'None' (например, из Excel).
+    """
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        # pd.isna() может бросить, если пришёл list / dict — считаем
+        # это невалидным ID и отсеиваем.
+        return True
+    s = str(value).strip().lower()
+    return s in {'', 'nan', 'none', 'null', 'n/a', 'na', '<na>'}
+
+
 def _next_engineer_id(eng_df) -> str:
     """ENG-NNN — следующая свободная нумерация."""
     max_n = 0
@@ -794,6 +817,23 @@ def render_dependencies() -> None:
     tasks_df = dfs['tasks_df']
     task_ids = tasks_df['task_id'].astype(str).tolist()
 
+    # В deps_df могут быть связи, ссылающиеся на задачи, которых нет в Tasks
+    # (например, SRV-4013 → SRV-4014, когда ни той, ни другой нет в Task-секции).
+    # Планировщик их игнорирует и пишет warning, но из deps_df они не удаляются.
+    #
+    # Streamlit SelectboxColumn не может показать значение, которого нет
+    # в options — вместо него рисуется пустое поле. Чтобы «висячие» ID были
+    # видны и редактируемы, добавляем их в options вместе с валидными.
+    _deps_ids = set()
+    for _col in ('blocking_task_id', 'blocked_task_id'):
+        if _col in deps_df.columns:
+            _deps_ids.update(
+                deps_df[_col].dropna().astype(str).str.strip().tolist()
+            )
+    # Убираем пустышки и мусор
+    _deps_ids = {x for x in _deps_ids if x and x.lower() not in {'nan', 'none', 'null', '<na>'}}
+    task_ids = sorted(set(task_ids) | _deps_ids)
+
     st.markdown('##### ➕ Добавить связь')
     with st.form('add_dep_form', clear_on_submit=True):
         col1, col2, col3 = st.columns(3)
@@ -823,13 +863,20 @@ def render_dependencies() -> None:
     # Чистим пустые строки — могли попасть из Excel/парсера или быть
     # случайно добавлены пользователем в data_editor.
     deps_clean = deps_df.copy()
+    # Фильтруем пустые строки через pd.isna() + строковую нормализацию.
+    # Применяем маску ДО приведения к строке, чтобы NaN / None / pd.NA
+    # отсеивались на уровне pandas, а не через astype(str), поведение
+    # которого нестабильно между версиями.
+    mask_blank = (
+        deps_clean['blocking_task_id'].apply(_is_blank_id)
+        | deps_clean['blocked_task_id'].apply(_is_blank_id)
+    )
+    deps_clean = deps_clean[~mask_blank].reset_index(drop=True)
+    # Приводим рабочие значения к строке — теперь, когда мусор удалён,
+    # astype(str) не испортит реальные ID.
     for col in ('blocking_task_id', 'blocked_task_id'):
         if col in deps_clean.columns:
             deps_clean[col] = deps_clean[col].astype(str).str.strip()
-    deps_clean = deps_clean[
-        (~deps_clean['blocking_task_id'].isin(['', 'nan', 'None', 'null']))
-        & (~deps_clean['blocked_task_id'].isin(['', 'nan', 'None', 'null']))
-    ].reset_index(drop=True)
 
     # Если в объекте DataFrame появились лишние пустые строки — обновим рабочее состояние
     if len(deps_clean) != len(deps_df):
@@ -847,15 +894,17 @@ def render_dependencies() -> None:
         },
     )
     if st.button('Применить правки в таблице связей'):
-        # Отфильтруем пустые строки, которые пользователь мог добавить, но не заполнить.
+        # Тот же фильтр, что и при чтении. Используем _is_blank_id —
+        # он ловит и NaN/None/pd.NA, и строковые заглушки 'nan'/'<NA>'.
         edited = edited.copy()
+        mask_blank = (
+            edited['blocking_task_id'].apply(_is_blank_id)
+            | edited['blocked_task_id'].apply(_is_blank_id)
+        )
+        edited = edited[~mask_blank].reset_index(drop=True)
         for col in ('blocking_task_id', 'blocked_task_id'):
             if col in edited.columns:
                 edited[col] = edited[col].astype(str).str.strip()
-        edited = edited[
-            (~edited['blocking_task_id'].isin(['', 'nan', 'None', 'null']))
-            & (~edited['blocked_task_id'].isin(['', 'nan', 'None', 'null']))
-        ].reset_index(drop=True)
         cycle = _has_cycle(edited)
         if cycle:
             st.error(f'После этих правок появляется цикл зависимостей: {" → ".join(c[0] for c in cycle)}. Правки не применены.')
@@ -863,6 +912,290 @@ def render_dependencies() -> None:
             _stage('update', 'dependency', comment=f'Таблица связей отредактирована целиком ({len(edited)} строк)')
             dfs['deps_df'] = edited
             st.success('Связи обновлены.')
+            st.rerun()
+
+# ==================================================================
+# ПЕРЕВОДЫ (управление реорганизацией)
+# ==================================================================
+
+def render_transfers() -> None:
+    """Управление переводами между командами.
+
+    Источник истины — `st.session_state['_forbidden_donors_value']` (set
+    кортежей (donor_team, role)). Он читается в app.py, передаётся в
+    `SmartScheduler.run_smart_planning(forbidden_donors=...)` и сохраняется
+    в runtime_state при каждом изменении. Кнопки ниже меняют этот set и
+    вызывают st.rerun() — на следующем прогоне план пересчитывается, а
+    runtime_state обновляется автоматически (по хешу).
+    """
+    ctx = st.session_state.get('_transfers_context', {})
+    active_summary = ctx.get('active_summary', pd.DataFrame())
+    active_detail = ctx.get('active_detail', pd.DataFrame())
+    baseline_detail = ctx.get('baseline_detail', pd.DataFrame())
+
+    forbidden = set(st.session_state.get('_forbidden_donors_value', set()))
+
+    def _save_forbidden(new_set):
+        """Обновляем рабочий set и «рабочее» значение в session_state.
+        Следующий rerun увидит новое значение, пересчитает план и сохранит
+        его в runtime_state (хеш изменится)."""
+        st.session_state['_forbidden_donors_value'] = set(new_set)
+        st.session_state['_stored_forbidden_donors'] = [list(x) for x in new_set]
+
+    st.markdown('##### 🔄 Управление переводами')
+    st.caption(
+        'Планировщик при нехватке часов берёт доноров из других команд. '
+        'Запреты сохраняются в state.db и переживают перезапуск.'
+    )
+    st.info(
+        '**Важно:** запрет перевода не удаляет задачу из плана. '
+        'Планировщик сначала ищет **другого** донора на эту роль. '
+        'Если альтернативы нет — задача переходит в **сплит** '
+        '(делает то, что может, своими силами). '
+        'Задача исчезнет из плана только если её нельзя выполнить вообще: '
+        'тогда она попадёт в «Не поместились в квартал» с причиной '
+        '«Дефицит специалистов» или «Нет специалистов в штате».'
+    )
+
+    # ---------- Активные переводы ----------
+    st.markdown('##### ✅ Активные переводы')
+    if active_detail.empty:
+        st.info('В текущем плане переводов между командами нет.')
+    else:
+        hdr = st.columns([1, 2, 2, 2, 2, 2, 1, 1])
+        for col, label in zip(hdr, ['Спринт', 'Задача', 'Донор', 'Роль',
+                                     'Получатель', 'Инженер', 'ЧЧ', '']):
+            col.markdown(f'**{label}**')
+
+        for idx, row in active_detail.iterrows():
+            donor = str(row.get('donor_team') or '').strip()
+            role = str(row.get('role') or '').strip()
+            c = st.columns([1, 2, 2, 2, 2, 2, 1, 1])
+            c[0].write(str(row.get('sprint') or ''))
+            c[1].write(str(row.get('task_id') or ''))
+            c[2].write(donor)
+            c[3].write(role)
+            c[4].write(str(row.get('recipient_team') or ''))
+            c[5].write(str(row.get('donor_engineer') or '—'))
+            c[6].write(f"{float(row.get('hours') or 0):.0f}")
+            if c[7].button('🚫', key=f'forbid_{idx}_{donor}_{role}',
+                           help='Запретить этот перевод'):
+                new_set = set(forbidden)
+                new_set.add((donor, role))
+                _save_forbidden(new_set)
+                st.rerun()
+
+    st.markdown('---')
+
+    # ---------- Запрещённые переводы ----------
+    st.markdown('##### 🚫 Запрещённые переводы')
+    st.caption(
+        'Нажмите «↩️», чтобы разрешить перевод обратно — план пересчитается, '
+        'и планировщик снова сможет использовать эту связку.'
+    )
+    if not forbidden:
+        st.caption('Список запретов пуст.')
+    else:
+        # Контекст запрета — из baseline, чтобы показать задачу, инженера и ЧЧ.
+        baseline_index = {}
+        if not baseline_detail.empty:
+            for _, r in baseline_detail.iterrows():
+                key = (str(r.get('donor_team') or '').strip(),
+                       str(r.get('role') or '').strip())
+                if key not in baseline_index:
+                    baseline_index[key] = r
+
+        # Для каждого запрета показываем, что произошло с задачей после
+        # запрета: сплитуется, вылетела из плана, или всё ещё завершается
+        # (если задачу закрывает кто-то другой).
+        _active_by_task = {}
+        if not active_detail.empty:
+            for _, r in active_detail.iterrows():
+                _active_by_task.setdefault(str(r.get('task_id') or ''), []).append(r)
+
+        hdr2 = st.columns([2, 2, 2, 2, 2, 1, 2, 1])
+        for col, label in zip(hdr2, ['Донор', 'Роль', 'Куда передавали',
+                                      'Задача', 'Инженер', 'ЧЧ',
+                                      'Что стало с задачей', '']):
+            col.markdown(f'**{label}**')
+
+        for idx, (donor, role) in enumerate(sorted(forbidden)):
+            row = baseline_index.get((donor, role))
+            recipient = str(row.get('recipient_team') or '—') if row is not None else '—'
+            task_id = str(row.get('task_id') or '—') if row is not None else '—'
+            donor_eng = str(row.get('donor_engineer') or '—') if row is not None else '—'
+            hours = float(row.get('hours') or 0) if row is not None else 0.0
+
+            # Ищем статус задачи в текущем плане
+            task_impact = '—'
+            if task_id != '—':
+                task_rows_in_plan = _active_by_task.get(task_id, [])
+                if task_rows_in_plan:
+                    # Задача в плане, но уже без этого перевода
+                    task_impact = '🔁 донор заменён'
+                else:
+                    # Проверяем, есть ли задача в плане вообще
+                    _task_in_plan = any(
+                        task_id in str(item.get('task_id', ''))
+                        for items in st.session_state.get('_transfers_context', {}) \
+                                .get('active_detail', pd.DataFrame()).to_dict('records')
+                        for item in [items]
+                    )
+                    # Более надёжно — свериться с c_statuses через app
+                    # Здесь просто пометим как «проверьте статус задачи»
+                    task_impact = '⚠️ проверьте статус'
+
+            c = st.columns([2, 2, 2, 2, 2, 1, 2, 1])
+            c[0].write(donor)
+            c[1].write(role)
+            c[2].write(recipient)
+            c[3].write(task_id)
+            c[4].write(donor_eng)
+            c[5].write(f'{hours:.0f}')
+            c[6].write(task_impact)
+            if c[7].button('↩️', key=f'unforbid_{idx}_{donor}_{role}',
+                           help='Разрешить перевод обратно — планировщик снова '
+                                'сможет использовать эту связку'):
+                new_set = set(forbidden)
+                new_set.discard((donor, role))
+                _save_forbidden(new_set)
+                st.rerun()
+
+    st.markdown('---')
+    st.caption(
+        f'Всего переводов в baseline: **{len(baseline_detail)}**. '
+        f'Активных сейчас: **{len(active_detail)}**. '
+        f'Запрещено: **{len(forbidden)}**.'
+    )
+
+    if not active_summary.empty:
+        csv_active = active_summary.to_csv(index=False, sep=';').encode('utf-8-sig')
+        st.download_button(
+            '⬇️ Скачать активные переводы (CSV)',
+            data=csv_active,
+            file_name='pochtatech_transfers_active.csv',
+            mime='text/csv',
+            key='download_transfers_active',
+        )
+
+# ==================================================================
+# ЗАДАЧИ ВНЕ ПЛАНА (принудительная постановка)
+# ==================================================================
+
+def render_forced_tasks() -> None:
+    """Принудительная постановка задач вне плана.
+
+    Пользователь может взять любую задачу и поставить её на один или
+    несколько спринтов, не считаясь с SP, ЧЧ и зависимостями. SP и ЧЧ
+    из пулов команды НЕ вычитаются.
+    """
+    ctx = st.session_state.get('_forced_context', {})
+    all_task_ids = ctx.get('all_task_ids', [])
+    tasks_in_plan = set(ctx.get('tasks_in_plan', []))
+    task_meta = ctx.get('task_meta', {})
+
+    forced = dict(st.session_state.get('_forced_schedule_value', {}) or {})
+
+    def _save_forced(new_forced):
+        st.session_state['_forced_schedule_value'] = dict(new_forced)
+
+    st.markdown('##### 📌 Задачи вне плана')
+    st.caption(
+        'Задача появится в плане на выбранных спринтах с пометкой '
+        '«Принудительно (вне плана)». SP и ЧЧ из пулов команды **не '
+        'списываются** — это ручное решение поверх алгоритма. '
+        'Зависимости не проверяются. Сохраняется в state.db и переживает '
+        'перезапуск приложения.'
+    )
+
+    st.markdown('**➕ Поставить задачу на спринт**')
+    with st.form('add_forced_form', clear_on_submit=True):
+        col1, col2 = st.columns([3, 2])
+        sorted_ids = sorted(all_task_ids, key=lambda x: (x in tasks_in_plan, x))
+        selected = col1.selectbox(
+            'Задача:',
+            options=['—'] + sorted_ids,
+            key='forced_add_task',
+            help='Можно выбрать любую задачу. Те, что не в плане, показаны первыми.',
+        )
+        sprints = col2.multiselect(
+            'Спринты:',
+            options=[1, 2, 3, 4, 5, 6],
+            default=[1],
+            key='forced_add_sprints',
+            help='Можно выбрать несколько — задача будет растянута на них.',
+        )
+        if selected != '—' and selected in task_meta:
+            m = task_meta[selected]
+            st.caption(
+                f"**{selected}** — {m.get('summary', '') or 'без описания'}  \n"
+                f"Команда: `{m.get('team', '')}` · "
+                f"rung: `{m.get('rung', 0)}` · SP: `{m.get('sp', 0)}` · "
+                f"статус: `{m.get('status', '')}` · "
+                f"{'✅ в плане' if selected in tasks_in_plan else '⚠️ не в плане'}"
+            )
+        comment = st.text_input('Комментарий (необязательно):', key='forced_add_comment')
+        submitted = st.form_submit_button('📌 Поставить')
+        if submitted:
+            if selected == '—':
+                st.error('Выберите задачу.')
+            elif not sprints:
+                st.error('Выберите хотя бы один спринт.')
+            else:
+                new_forced = dict(forced)
+                new_forced[selected] = {
+                    'sprints': sorted(int(s) for s in sprints),
+                    'comment': (comment or '').strip(),
+                }
+                _save_forced(new_forced)
+                st.success(
+                    f'Задача {selected} поставлена на спринты: '
+                    f'{", ".join(map(str, sorted(sprints)))}.'
+                )
+                st.rerun()
+
+    st.markdown('---')
+    st.markdown('##### 🚀 Уже принудительно поставлены')
+    if not forced:
+        st.caption('Список пуст.')
+    else:
+        hdr = st.columns([2, 1, 2, 2, 3, 1])
+        for col, label in zip(hdr, ['Задача', 'Спринты', 'Команда', 'SP задачи',
+                                     'Комментарий', '']):
+            col.markdown(f'**{label}**')
+
+        for t_id in sorted(forced.keys()):
+            entry = forced[t_id]
+            sprints = entry.get('sprints', []) if isinstance(entry, dict) else []
+            comment = entry.get('comment', '') if isinstance(entry, dict) else ''
+            m = task_meta.get(t_id, {})
+            team = m.get('team', '') or '—'
+            sp = m.get('sp', 0)
+            summary = m.get('summary', '') or ''
+
+            c = st.columns([2, 1, 2, 2, 3, 1])
+            c[0].markdown(f"**{t_id}**  \n<small>{summary[:60]}</small>",
+                          unsafe_allow_html=True)
+            c[1].write(', '.join(map(str, sprints)))
+            c[2].write(team)
+            c[3].write(str(sp))
+            c[4].write(comment or '—')
+            if c[5].button('🗑️', key=f'unforce_{t_id}',
+                           help='Убрать принудительную постановку'):
+                new_forced = dict(forced)
+                del new_forced[t_id]
+                _save_forced(new_forced)
+                st.rerun()
+
+        st.caption(
+            f'Всего принудительно поставлено: **{len(forced)}**. '
+            f'Их SP и ЧЧ не учитываются в утилизации команд.'
+        )
+
+    if forced:
+        st.markdown('---')
+        if st.button('🗑️ Снять все принудительные задачи', type='secondary'):
+            _save_forced({})
             st.rerun()
 
 
@@ -1033,6 +1366,8 @@ def render(storage) -> None:
         '🏢 Команды',
         '📋 Задачи',
         '🔗 Зависимости',
+        '🔄 Переводы',
+        '📌 Вне плана',
         '💰 Сметы',
         '💾 Сохранение / История',
     ])
@@ -1045,6 +1380,10 @@ def render(storage) -> None:
     with sub_tabs[3]:
         render_dependencies()
     with sub_tabs[4]:
-        render_estimates()
+        render_transfers()
     with sub_tabs[5]:
+        render_forced_tasks()
+    with sub_tabs[6]:
+        render_estimates()
+    with sub_tabs[7]:
         render_save_panel(storage)
